@@ -23,6 +23,20 @@ Some Lakekeeper endpoints return links pointing at Lakekeeper itself. By default
 | `LAKEKEEPER__ALLOW_ORIGIN`                         | `*`                                    | A comma separated list of allowed origins for CORS. |
 | <nobr>`LAKEKEEPER__USE_X_FORWARDED_HEADERS`</nobr> | <nobr>`false`<nobr>                    | If true, Lakekeeper respects the `x-forwarded-host`, `x-forwarded-proto`, `x-forwarded-port` and `x-forwarded-prefix` headers in incoming requests. This is mostly relevant for the `/config` endpoint. Default: `true` (Headers are respected.) |
 
+### Pagination
+
+Lakekeeper has default values for `default` and `max` page sizes of paginated queries. These are safeguards against malicious requests and the problems related to large page sizes (see below).
+
+The REST catalog [spec](https://github.com/apache/iceberg/blob/404c8057275c9cfe204f2c7cc61114c128fbf759/open-api/rest-catalog-open-api.yaml#L2030-L2032)) requires servers to return *all* results if `pageToken` is not set in the request. To obtain that behavior, set `LAKEKEEPER__PAGINATION_SIZE_MAX` to 4294967295 (`u32::MAX`, more would lead to practical problems). Things to keep in mind:
+
+- Retrieving huge numbers of rows is expensive, which might be exploited by malicious requests.
+- Requests may time out or responses may exceed size limits for huge numbers of results. 
+
+| Variable                                                    | Example            | Description |
+|-------------------------------------------------------------|--------------------|-----|
+| <nobr>`LAKEKEEPER__PAGINATION_SIZE_DEFAULT`<nobr>           | <nobr>`1024`<nobr> | The default page size used for paginated queries. This value is used if the request's `pageToken` is set but empty. Default: `100` |
+| <nobr>`LAKEKEEPER__PAGINATION_SIZE_MAX`<nobr>               | <nobr>`2048`<nobr> | The max page size used for paginated queries. This value is used if the request's `pageToken` is not set. Default: `1000` |
+ 
 ### Storage
 
 | Variable                                                    | Example            | Description |
@@ -170,7 +184,7 @@ The following Authenticators are available. Enabled Authenticators are checked i
    **Enabled if:** `LAKEKEEPER__ENABLE_KUBERNETES_AUTHENTICATION` is true and `LAKEKEEPER__KUBERNETES_AUTHENTICATION_ACCEPT_LEGACY_SERVICEACCOUNT` is true<br>
    **Validates Token with:** Kubernetes `TokenReview` API<br>
    **Accepts JWT if:**<br>
-    - Tokens issuer is `kubernetes/serviceaccount`
+    - Tokens issuer is `kubernetes/serviceaccount` or `https://kubernetes.default.svc.cluster.local`
 
 If `LAKEKEEPER__OPENID_PROVIDER_URI` is specified, Lakekeeper will  verify access tokens against this provider. The provider must provide the `.well-known/openid-configuration` endpoint and the openid-configuration needs to have `jwks_uri` and `issuer` defined. 
 
@@ -208,6 +222,7 @@ Authorization is only effective if [Authentication](#authentication) is enabled.
 | `LAKEKEEPER__OPENFGA__SCOPE`                       | `openfga`                                                                  | Additional scopes to request in the Client Credential flow. |
 | `LAKEKEEPER__OPENFGA__AUTHORIZATION_MODEL_PREFIX`  | `collaboration`                                                            | Explicitly set the Authorization model prefix. Defaults to `collaboration` if not set. We recommend to use this setting only in combination with `LAKEKEEPER__OPENFGA__AUTHORIZATION_MODEL_PREFIX`. |
 | `LAKEKEEPER__OPENFGA__AUTHORIZATION_MODEL_VERSION` | `3.1`                                                                      | Version of the model to use. If specified, the specified model version must already exist. This can be used to roll-back to previously applied model versions or to connect to externally managed models. Migration is disabled if the model version is set. Version should have the format <major>.<minor>. |
+| <nobr>`LAKEKEEPER__OPENFGA__MAX_BATCH_CHECK_SIZE`</nobr> | `50`                                                                      | p The maximum number of checks than can be handled by a batch check request. This is a [configuration option](https://openfga.dev/docs/getting-started/setup-openfga/configuration#OPENFGA_MAX_CHECKS_PER_BATCH_CHECK) of the `OpenFGA` server with default value 50. |
 
 ### UI
 
