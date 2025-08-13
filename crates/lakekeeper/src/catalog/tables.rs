@@ -926,7 +926,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
                 CatalogNamespaceAction::CanCreateTable,
             )
             .await
-            .map_err(|e| set_not_found_status_code(e))?;
+            .map_err(set_not_found_status_code)?;
 
         // ------------------- BUSINESS LOGIC -------------------
         if source == destination {
