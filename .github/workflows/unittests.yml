@@ -346,14 +346,18 @@ jobs:
           tool: cargo-nextest
 
       - name: Migrate database
+        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3
         if: ${{ env.AURORA_DATABASE_URL != '' }}
-        run: |
-          export DEBIAN_FRONTEND=noninteractive 
-          sudo apt-get update && sudo apt-get install -yqq libpq-dev --no-install-recommends
-          cargo install -q --version=0.8.2 sqlx-cli --no-default-features --features postgres
-          cd crates/lakekeeper
-          sqlx database create
-          sqlx migrate run
+        with:
+          max_attempts: 3
+          timeout_minutes: 4
+          command: |
+            export DEBIAN_FRONTEND=noninteractive 
+            sudo apt-get update && sudo apt-get install -yqq libpq-dev --no-install-recommends
+            cargo install -q --version=0.8.2 sqlx-cli --no-default-features --features postgres
+            cd crates/lakekeeper
+            sqlx database create
+            sqlx migrate run
         env:
           DATABASE_URL: ${{ secrets.AURORA_DATABASE_URL }}
 
