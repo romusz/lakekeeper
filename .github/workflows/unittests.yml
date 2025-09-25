@@ -30,6 +30,7 @@ jobs:
       - clippy
       - check-generated-openapi-matches
       - test
+      - test-aurora
     steps:
       - run: exit 0
   sqlx-check:
@@ -286,3 +287,115 @@ jobs:
         run: cargo test --no-fail-fast --doc --all-features --workspace
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+
+  test-aurora:
+    runs-on: ubuntu-24.04
+    services:
+      vault:
+        image: hashicorp/vault:latest
+        ports:
+          - 8200:8200
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: myroot
+          VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+        options: >-
+          --health-cmd "vault status -address http://localhost:8200"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      AURORA_DATABASE_URL: ${{ secrets.AURORA_DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Start Minio Docker Container
+        run: |
+          docker run -d --name minio -p 9000:9000 -p 9001:9001 \
+            -e "MINIO_ROOT_USER=minio-root-user" \
+            -e "MINIO_ROOT_PASSWORD=minio-root-password" \
+            minio/minio:RELEASE.2025-07-23T15-54-02Z server --console-address ":9001" /data
+      
+      - name: Wait for Minio to be healthy
+        shell: bash
+        run: |
+          for i in {1..10}; do
+            if curl -I http://localhost:9000/minio/health/live; then
+              echo "Minio is healthy"
+              exit 0
+            else
+              echo "Waiting for Minio to be healthy..."
+              sleep 5
+            fi
+          done
+          echo "Minio did not become healthy in time"
+          exit 1
+
+      - name: Create Minio Bucket
+        run: |
+          docker exec minio /usr/bin/mc alias set local http://localhost:9000 minio-root-user minio-root-password
+          docker exec minio /usr/bin/mc mb local/tests
+
+      - name: Setup Rust toolchain and cache
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        env:
+          RUST_CACHE_KEY_OS: rust-${{ env.RUST_TOOLCHAIN }}-cache-ubuntu-24.04
+
+      - name: Setup cargo nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Migrate database
+        if: ${{ env.AURORA_DATABASE_URL != '' }}
+        run: |
+          export DEBIAN_FRONTEND=noninteractive 
+          sudo apt-get update && sudo apt-get install -yqq libpq-dev --no-install-recommends
+          cargo install -q --version=0.8.2 sqlx-cli --no-default-features --features postgres
+          cd crates/lakekeeper
+          sqlx database create
+          sqlx migrate run
+        env:
+          DATABASE_URL: ${{ secrets.AURORA_DATABASE_URL }}
+
+      - name: Setup vault
+        run: |
+          export VAULT_ADDR=http://localhost:8200
+          export DEBIAN_FRONTEND=noninteractive 
+          sudo apt update && sudo apt install gpg wget
+          wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          gpg --no-default-keyring --keyring /usr/share/keyrings/hashicorp-archive-keyring.gpg --fingerprint
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt update && sudo apt install vault
+
+          vault login -address "${VAULT_ADDR}" myroot
+          vault auth  enable -address "${VAULT_ADDR}"  userpass
+          echo "path \"secret/*\" { capabilities = [\"create\", \"read\", \"update\", \"delete\", \"list\"] }" > /tmp/app.hcl
+          vault policy write -address "${VAULT_ADDR}" app /tmp/app.hcl
+          vault write -address "${VAULT_ADDR}" auth/userpass/users/test password=test policies=app
+
+      - name: Setup openfga
+        run: docker run -d -p 35081:8081 openfga/openfga:v1.8 run
+
+      - name: Test (Aurora)
+        if: ${{ env.AURORA_DATABASE_URL != '' }}
+        run: cargo nextest run --profile ci_no_secrets --all-targets --all-features --workspace --locked
+        env:
+          DATABASE_URL: ${{ secrets.AURORA_DATABASE_URL }}
+          LAKEKEEPER_TEST__KV2__URL: http://localhost:8200
+          LAKEKEEPER_TEST__KV2__USER: test
+          LAKEKEEPER_TEST__KV2__PASSWORD: test
+          LAKEKEEPER_TEST__KV2__SECRET_MOUNT: secret
+          # minio test envs
+          LAKEKEEPER_TEST__S3_BUCKET: tests
+          LAKEKEEPER_TEST__S3_REGION: local
+          LAKEKEEPER_TEST__S3_ACCESS_KEY: minio-root-user
+          LAKEKEEPER_TEST__S3_SECRET_KEY: minio-root-password
+          LAKEKEEPER_TEST__S3_ENDPOINT: http://localhost:9000
+
+          LAKEKEEPER_TEST__OPENFGA__ENDPOINT: http://localhost:35081
+      - name: Upload junit
+        if: ${{ env.AURORA_DATABASE_URL != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit
+          path: target/nextest/ci/junit.xml
