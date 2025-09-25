@@ -397,9 +397,3 @@ jobs:
           LAKEKEEPER_TEST__S3_ENDPOINT: http://localhost:9000
 
           LAKEKEEPER_TEST__OPENFGA__ENDPOINT: http://localhost:35081
-      - name: Upload junit
-        if: ${{ env.AURORA_DATABASE_URL != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: junit
-          path: target/nextest/ci/junit.xml
