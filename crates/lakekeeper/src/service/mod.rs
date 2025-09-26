@@ -103,7 +103,7 @@ impl std::fmt::Display for ServerId {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Copy)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Copy)]
 #[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[cfg_attr(feature = "sqlx", sqlx(transparent))]
 #[serde(transparent)]
@@ -443,7 +443,7 @@ impl TryFrom<TabularId> for TableId {
 
     fn try_from(value: TabularId) -> Result<Self, Self::Error> {
         match value {
-            TabularId::Table(value) => Ok(value.into()),
+            TabularId::Table(value) => Ok(value),
             TabularId::View(_) => Err(ErrorModel::internal(
                 "Provided identifier is not a table id",
                 "IdentifierIsNotTableID",
@@ -542,23 +542,13 @@ impl TryFrom<Prefix> for WarehouseId {
 }
 
 #[derive(Debug, Clone)]
-/// Metadata for a tabular dataset, including its unique `table_id` and
-/// the storage `location` where its data lives.
+/// Metadata for a tabular dataset, including its `warehouse_id`, `table_id` and the storage
+/// `location` where its data lives.
+///
+/// Note that `table_id`s can be reused across warehouses. So `table_id` may not be unique, but
+/// `(warehouse_id, table_id)` is.
 pub struct TabularDetails {
+    pub warehouse_id: WarehouseId,
     pub table_id: TableId,
     pub location: String,
-}
-
-impl Deref for TabularDetails {
-    type Target = TableId;
-
-    fn deref(&self) -> &Self::Target {
-        &self.table_id
-    }
-}
-
-impl AsRef<TableId> for TabularDetails {
-    fn as_ref(&self) -> &TableId {
-        &self.table_id
-    }
 }

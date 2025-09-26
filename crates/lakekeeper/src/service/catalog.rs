@@ -13,8 +13,8 @@ pub use iceberg_ext::catalog::rest::{CommitTableResponse, CreateTableRequest};
 use lakekeeper_io::Location;
 
 use super::{
-    authz::TableUuid, storage::StorageProfile, NamespaceId, ProjectId, RoleId, TableId,
-    TabularDetails, ViewId, WarehouseId, WarehouseStatus,
+    storage::StorageProfile, NamespaceId, ProjectId, RoleId, TableId, TabularDetails, ViewId,
+    WarehouseId, WarehouseStatus,
 };
 pub use crate::api::iceberg::v1::{
     CreateNamespaceRequest, CreateNamespaceResponse, ListNamespacesQuery, NamespaceIdent, Result,
@@ -39,6 +39,7 @@ use crate::{
     request_metadata::RequestMetadata,
     service::{
         authn::UserId,
+        authz::TableUuid,
         health::HealthExt,
         tabular_idents::{TabularId, TabularIdentOwned},
         task_queue::{
@@ -516,12 +517,12 @@ where
         transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
     ) -> Result<String>;
 
-    /// Undrop a table.
+    /// Undrop a table or view.
     ///
     /// Undrops a soft-deleted table. Does not work if the table was hard-deleted.
     /// Returns the task id of the expiration task associated with the soft-deletion.
     async fn clear_tabular_deleted_at(
-        table_id: &[TableId],
+        tabular_id: &[TabularId],
         warehouse_id: WarehouseId,
         transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
     ) -> Result<Vec<UndropTabularResponse>>;
@@ -890,7 +891,10 @@ where
                         TaskEntity::Table {
                             warehouse_id: wid, ..
                         } if *wid != w => continue,
-                        TaskEntity::Table { .. } => (),
+                        TaskEntity::View {
+                            warehouse_id: wid, ..
+                        } if *wid != w => continue,
+                        TaskEntity::View { .. } | TaskEntity::Table { .. } => (),
                     }
                 }
                 cached_results.insert(*id, cached_value);

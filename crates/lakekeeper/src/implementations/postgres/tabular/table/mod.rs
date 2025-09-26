@@ -124,7 +124,8 @@ where
     .await?
     .map(|(id, location)| match id {
         TabularId::Table(tab) => Ok(TabularDetails {
-            table_id: tab.into(),
+            warehouse_id,
+            table_id: tab,
             location,
         }),
         TabularId::View(_) => Err(ErrorModel::builder()
@@ -226,7 +227,7 @@ where
     tabulars.map::<TableId, TableInfo>(
         |k| match k {
             TabularId::Table(t) => {
-                let r: Result<TableId> = Ok(TableId::from(t));
+                let r: Result<TableId> = Ok(t);
                 r
             }
             TabularId::View(_) => Err(ErrorModel::internal(
@@ -992,7 +993,7 @@ pub(crate) async fn rename_table(
 ) -> Result<()> {
     crate::implementations::postgres::tabular::rename_tabular(
         warehouse_id,
-        TabularId::Table(*source_id),
+        TabularId::Table(source_id),
         source,
         destination,
         transaction,
@@ -1010,7 +1011,7 @@ pub(crate) async fn drop_table(
 ) -> Result<String> {
     drop_tabular(
         warehouse_id,
-        TabularId::Table(*table_id),
+        TabularId::Table(table_id),
         force,
         None,
         transaction,
@@ -2069,14 +2070,13 @@ pub(crate) mod tests {
 
         let _ = TabularExpirationTask::schedule_task::<PostgresCatalog>(
             TaskMetadata {
-                entity_id: EntityId::Tabular(*table.table_id),
+                entity_id: EntityId::Table(table.table_id),
                 warehouse_id,
                 parent_task_id: None,
                 schedule_for: Some(chrono::Utc::now() + chrono::Duration::seconds(1)),
                 entity_name: table.table_ident.into_name_parts(),
             },
             TabularExpirationPayload {
-                tabular_type: crate::api::management::v1::TabularType::Table,
                 deletion_kind: DeleteKind::Purge,
             },
             &mut transaction,
@@ -2086,7 +2086,7 @@ pub(crate) mod tests {
 
         mark_tabular_as_deleted(
             warehouse_id,
-            TabularId::Table(*table.table_id),
+            TabularId::Table(table.table_id),
             false,
             None,
             &mut transaction,
