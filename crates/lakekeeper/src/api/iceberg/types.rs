@@ -21,7 +21,19 @@ impl Prefix {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl From<String> for Prefix {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for Prefix {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub enum PageToken {
     /// The value is present and not ""
@@ -29,6 +41,8 @@ pub enum PageToken {
     /// The value is not present
     NotSpecified,
     /// Specified but empty
+    #[default]
+    // Empty indicates pagination is supported by the client, hence its default.
     Empty,
 }
 

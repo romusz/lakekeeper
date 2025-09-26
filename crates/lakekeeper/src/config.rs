@@ -253,14 +253,6 @@ pub struct DynAppConfig {
     )]
     pub endpoint_stat_flush_interval: Duration,
 
-    // ------------- Internal -------------
-    /// Optional server id. We recommend to not change this unless multiple catalogs
-    /// are sharing the same Authorization system.
-    /// If not specified, 00000000-0000-0000-0000-000000000000 is used.
-    /// This ID must not be changed after start!
-    #[serde(default = "uuid::Uuid::nil")]
-    pub server_id: uuid::Uuid,
-
     // ------------- Testing -------------
     pub skip_storage_validation: bool,
 }
@@ -508,7 +500,7 @@ impl Default for DynAppConfig {
             kubernetes_authentication_accept_legacy_serviceaccount: false,
             openid_subject_claim: None,
             listen_port: 8181,
-            bind_ip: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+            bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             health_check_frequency_seconds: 10,
             kv2: None,
             authz_backend: AuthZBackend::AllowAll,
@@ -519,7 +511,6 @@ impl Default for DynAppConfig {
             pagination_size_default: 100,
             pagination_size_max: 1000,
             endpoint_stat_flush_interval: Duration::from_secs(30),
-            server_id: uuid::Uuid::nil(),
             serve_swagger_ui: true,
             skip_storage_validation: false,
         }
@@ -545,6 +536,12 @@ impl DynAppConfig {
         page_size.map_or(self.pagination_size_max.into(), |i| {
             i.clamp(1, self.pagination_size_max.into())
         })
+    }
+
+    pub fn page_size_or_pagination_default(&self, page_size: Option<i64>) -> i64 {
+        page_size
+            .unwrap_or(self.pagination_size_default.into())
+            .clamp(1, self.pagination_size_max.into())
     }
 }
 
@@ -583,7 +580,7 @@ impl FromStr for PgSslMode {
             "require" => Ok(Self::Require),
             "verifyca" | "verify-ca" | "verify_ca" => Ok(Self::VerifyCa),
             "verifyfull" | "verify-full" | "verify_full" => Ok(Self::VerifyFull),
-            _ => Err(anyhow!("PgSslMode not supported: '{}'", s)),
+            _ => Err(anyhow!("PgSslMode not supported: '{s}'")),
         }
     }
 }
@@ -1072,7 +1069,7 @@ mod test {
         figment::Jail::expect_with(|jail| {
             jail.set_env("LAKEKEEPER_TEST__BIND_IP", "0.0.0.0");
             let config = get_config();
-            assert_eq!(config.bind_ip, IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+            assert_eq!(config.bind_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
             Ok(())
         });
     }
@@ -1082,7 +1079,7 @@ mod test {
         figment::Jail::expect_with(|jail| {
             jail.set_env("LAKEKEEPER_TEST__BIND_IP", "127.0.0.1");
             let config = get_config();
-            assert_eq!(config.bind_ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+            assert_eq!(config.bind_ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
             Ok(())
         });
     }
@@ -1092,10 +1089,7 @@ mod test {
         figment::Jail::expect_with(|jail| {
             jail.set_env("LAKEKEEPER_TEST__BIND_IP", "::1");
             let config = get_config();
-            assert_eq!(
-                config.bind_ip,
-                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))
-            );
+            assert_eq!(config.bind_ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
             Ok(())
         });
     }
@@ -1105,10 +1099,7 @@ mod test {
         figment::Jail::expect_with(|jail| {
             jail.set_env("LAKEKEEPER_TEST__BIND_IP", "::");
             let config = get_config();
-            assert_eq!(
-                config.bind_ip,
-                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0))
-            );
+            assert_eq!(config.bind_ip, IpAddr::V6(Ipv6Addr::UNSPECIFIED));
             Ok(())
         });
     }

@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use super::{secrets::SecretInStorage, NamespaceId, TableId};
 use crate::{
     api::{
-        iceberg::v1::DataAccess, management::v1::warehouse::TabularDeleteProfile, CatalogConfig,
+        iceberg::v1::{tables::DataAccessMode, DataAccess},
+        management::v1::warehouse::TabularDeleteProfile,
+        CatalogConfig,
     },
     catalog::{compression_codec::CompressionCodec, io::list_location},
     request_metadata::RequestMetadata,
@@ -234,7 +236,7 @@ impl StorageProfile {
     #[allow(clippy::too_many_arguments)]
     pub async fn generate_table_config(
         &self,
-        data_access: DataAccess,
+        data_access: DataAccessMode,
         secret: Option<&StorageCredential>,
         table_location: &Location,
         storage_permissions: StoragePermissions,
@@ -429,7 +431,8 @@ impl StorageProfile {
                 DataAccess {
                     remote_signing: false,
                     vended_credentials: true,
-                },
+                }
+                .into(),
                 credential,
                 test_location,
                 StoragePermissions::ReadWriteDelete,
@@ -488,7 +491,6 @@ impl StorageProfile {
         );
         let mut test_file_write = metadata_location.parent();
         test_file_write.push("test");
-        println!("Test file write location: {test_file_write}");
         let mut test_file_write = test_file_write.parent();
         test_file_write.push("test");
         tracing::debug!("Validating access to: {}", test_file_write);
@@ -921,7 +923,6 @@ mod tests {
     use std::{collections::HashMap, str::FromStr};
 
     use iceberg::spec::{PartitionSpec, Schema, SortOrder, TableMetadata, TableMetadataBuilder};
-    use needs_env_var::needs_env_var;
 
     use super::{
         s3::{S3AwsSystemIdentityCredential, S3CloudflareR2Credential},
@@ -964,7 +965,7 @@ mod tests {
 
         let namespace_id: NamespaceId = uuid::uuid!("00000000-0000-0000-0000-000000000001").into();
         let namespace_location = profile.default_namespace_location(namespace_id).unwrap();
-        let table_id = TabularId::View(uuid::uuid!("00000000-0000-0000-0000-000000000002"));
+        let table_id = TabularId::View(uuid::uuid!("00000000-0000-0000-0000-000000000002").into());
         let table_location = profile.default_tabular_location(&namespace_location, table_id);
         assert_eq!(table_location.to_string(), target_location);
 
@@ -1134,110 +1135,128 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[needs_env_var::needs_env_var(TEST_AZURE = 1)]
-    async fn test_vended_az() {
-        for (cred, _typ) in [
-            (az::test::azure_tests::client_creds(), "client-credentials"),
-            (az::test::azure_tests::shared_key(), "shared-key"),
-        ] {
-            let mut profile: StorageProfile = az::test::azure_tests::azure_profile().into();
-            let cred: StorageCredential = cred.into();
+    mod azure_integration_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_vended_az() {
+            for (cred, _typ) in [
+                (
+                    super::az::test::azure_integration_tests::client_creds(),
+                    "client-credentials",
+                ),
+                (
+                    super::az::test::azure_integration_tests::shared_key(),
+                    "shared-key",
+                ),
+            ] {
+                let mut profile: StorageProfile =
+                    az::test::azure_integration_tests::azure_profile().into();
+                let cred: StorageCredential = cred.into();
+                test_profile_vended_creds(&cred, &mut profile).await;
+                test_profile_io(&cred, &mut profile).await;
+            }
+        }
+    }
+
+    mod gcs_integration_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_vended_gcs() {
+            let key_prefix = Some(format!("test_prefix-{}", uuid::Uuid::now_v7()));
+            let cred: StorageCredential = std::env::var("LAKEKEEPER_TEST__GCS_CREDENTIAL")
+                .map(|s| GcsCredential::ServiceAccountKey {
+                    key: serde_json::from_str::<GcsServiceKey>(&s).unwrap(),
+                })
+                .map_err(|_| ())
+                .expect("Missing cred")
+                .into();
+            let bucket = std::env::var("LAKEKEEPER_TEST__GCS_BUCKET").expect("Missing bucket");
+            let mut profile: StorageProfile = GcsProfile {
+                bucket,
+                key_prefix: key_prefix.clone(),
+            }
+            .into();
+
             test_profile_vended_creds(&cred, &mut profile).await;
             test_profile_io(&cred, &mut profile).await;
         }
     }
 
-    #[tokio::test]
-    #[needs_env_var::needs_env_var(TEST_GCS = 1)]
-    async fn test_vended_gcs() {
-        let key_prefix = Some(format!("test_prefix-{}", uuid::Uuid::now_v7()));
-        let cred: StorageCredential = std::env::var("LAKEKEEPER_TEST__GCS_CREDENTIAL")
-            .map(|s| GcsCredential::ServiceAccountKey {
-                key: serde_json::from_str::<GcsServiceKey>(&s).unwrap(),
-            })
-            .map_err(|_| ())
-            .expect("Missing cred")
-            .into();
-        let bucket = std::env::var("LAKEKEEPER_TEST__GCS_BUCKET").expect("Missing bucket");
-        let mut profile: StorageProfile = GcsProfile {
-            bucket,
-            key_prefix: key_prefix.clone(),
-        }
-        .into();
+    mod aws_integration_tests {
+        use super::*;
 
-        test_profile_vended_creds(&cred, &mut profile).await;
-        test_profile_io(&cred, &mut profile).await;
-    }
-
-    #[needs_env_var(TEST_AWS = 1)]
-    #[test]
-    fn test_vended_aws() {
-        crate::test::test_block_on(
-            async {
-                let key_prefix = format!("test_prefix-{}", uuid::Uuid::now_v7());
-                let bucket = std::env::var("AWS_S3_BUCKET").unwrap();
-                let region = std::env::var("AWS_S3_REGION").unwrap();
-                let sts_role_arn = std::env::var("AWS_S3_STS_ROLE_ARN").unwrap();
-                let cred: StorageCredential = S3Credential::AccessKey(S3AccessKeyCredential {
-                    aws_access_key_id: std::env::var("AWS_S3_ACCESS_KEY_ID").unwrap(),
-                    aws_secret_access_key: std::env::var("AWS_S3_SECRET_ACCESS_KEY").unwrap(),
-                    external_id: None,
-                })
-                .into();
-
-                let mut profile: StorageProfile = S3Profile::builder()
-                    .bucket(bucket)
-                    .key_prefix(key_prefix.clone())
-                    .region(region)
-                    .sts_role_arn(sts_role_arn)
-                    .sts_enabled(true)
-                    .flavor(S3Flavor::Aws)
-                    .build()
+        #[test]
+        fn test_vended_aws() {
+            crate::test::test_block_on(
+                async {
+                    let key_prefix = format!("test_prefix-{}", uuid::Uuid::now_v7());
+                    let bucket = std::env::var("AWS_S3_BUCKET").unwrap();
+                    let region = std::env::var("AWS_S3_REGION").unwrap();
+                    let sts_role_arn = std::env::var("AWS_S3_STS_ROLE_ARN").unwrap();
+                    let cred: StorageCredential = S3Credential::AccessKey(S3AccessKeyCredential {
+                        aws_access_key_id: std::env::var("AWS_S3_ACCESS_KEY_ID").unwrap(),
+                        aws_secret_access_key: std::env::var("AWS_S3_SECRET_ACCESS_KEY").unwrap(),
+                        external_id: None,
+                    })
                     .into();
 
-                test_profile_vended_creds(&cred, &mut profile).await;
-                test_profile_io(&cred, &mut profile).await;
-            },
-            true,
-        );
+                    let mut profile: StorageProfile = S3Profile::builder()
+                        .bucket(bucket)
+                        .key_prefix(key_prefix.clone())
+                        .region(region)
+                        .sts_role_arn(sts_role_arn)
+                        .sts_enabled(true)
+                        .flavor(S3Flavor::Aws)
+                        .build()
+                        .into();
+
+                    test_profile_vended_creds(&cred, &mut profile).await;
+                    test_profile_io(&cred, &mut profile).await;
+                },
+                true,
+            );
+        }
+
+        #[tokio::test]
+        // #[tracing_test::traced_test]
+        async fn test_validate_aws() {
+            use crate::service::storage::s3::test::aws_integration_tests::get_storage_profile;
+
+            let (profile, credential) = get_storage_profile();
+            let profile: StorageProfile = profile.into();
+            let cred: StorageCredential = credential.into();
+            Box::pin(profile.validate_access(
+                Some(&cred),
+                None,
+                &RequestMetadata::new_unauthenticated(),
+            ))
+            .await
+            .expect("Failed to validate access");
+        }
     }
 
-    #[needs_env_var(TEST_AWS = 1)]
-    #[tokio::test]
-    // #[tracing_test::traced_test]
-    async fn test_validate_aws() {
-        use super::s3::test::aws::get_storage_profile;
+    mod minio_integration_tests {
+        use super::*;
 
-        let (profile, credential) = get_storage_profile();
-        let profile: StorageProfile = profile.into();
-        let cred: StorageCredential = credential.into();
-        Box::pin(profile.validate_access(
-            Some(&cred),
-            None,
-            &RequestMetadata::new_unauthenticated(),
-        ))
-        .await
-        .expect("Failed to validate access");
-    }
+        #[test]
+        fn test_vended_s3_compat() {
+            use super::super::s3::test::minio_integration_tests::storage_profile;
 
-    #[needs_env_var::needs_env_var(TEST_MINIO = 1)]
-    #[test]
-    fn test_vended_s3_compat() {
-        use super::s3::test::s3_compat::storage_profile;
+            crate::test::test_block_on(
+                async {
+                    let key_prefix = format!("test_prefix-{}", uuid::Uuid::now_v7());
+                    let (profile, cred) = storage_profile(&key_prefix);
+                    let mut profile: StorageProfile = profile.into();
+                    let cred: StorageCredential = cred.into();
 
-        crate::test::test_block_on(
-            async {
-                let key_prefix = format!("test_prefix-{}", uuid::Uuid::now_v7());
-                let (profile, cred) = storage_profile(&key_prefix);
-                let mut profile: StorageProfile = profile.into();
-                let cred: StorageCredential = cred.into();
-
-                test_profile_vended_creds(&cred, &mut profile).await;
-                test_profile_io(&cred, &mut profile).await;
-            },
-            true,
-        );
+                    test_profile_vended_creds(&cred, &mut profile).await;
+                    test_profile_io(&cred, &mut profile).await;
+                },
+                true,
+            );
+        }
     }
 
     #[allow(dead_code)]
@@ -1309,7 +1328,8 @@ mod tests {
                 DataAccess {
                     vended_credentials: true,
                     remote_signing: false,
-                },
+                }
+                .into(),
                 Some(cred),
                 &table_location1,
                 StoragePermissions::ReadWriteDelete,
@@ -1325,7 +1345,8 @@ mod tests {
                 DataAccess {
                     vended_credentials: true,
                     remote_signing: false,
-                },
+                }
+                .into(),
                 Some(cred),
                 &table_location2,
                 StoragePermissions::ReadWriteDelete,

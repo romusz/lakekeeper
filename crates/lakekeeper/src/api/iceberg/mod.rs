@@ -24,7 +24,7 @@ pub mod v1 {
 
     pub use self::{
         namespace::{ListNamespacesQuery, NamespaceParameters, PaginationQuery},
-        tables::{DataAccess, ListTablesQuery, TableParameters},
+        tables::{DataAccess, DataAccessMode, ListTablesQuery, TableParameters},
         views::ViewParameters,
     };
     pub use crate::{
@@ -227,7 +227,7 @@ mod test {
     #[test]
     fn test_supported_endpoints() {
         let openapi = include_str!("../../../../../docs/docs/api/rest-catalog-open-api.yaml");
-        let s: serde_json::Value = serde_yml::from_str(openapi).unwrap();
+        let s: serde_json::Value = serde_norway::from_str(openapi).unwrap();
         let paths = s["paths"].as_object().unwrap();
         let unsupported = &[
             "/v1/oauth/tokens",

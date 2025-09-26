@@ -1,9 +1,6 @@
 use std::str::FromStr;
 
-use iceberg::{
-    spec::{FormatVersion, TableMetadata},
-    TableIdent,
-};
+use iceberg::{spec::TableMetadata, TableIdent};
 use iceberg_ext::catalog::rest::ErrorModel;
 use lakekeeper_io::Location;
 use sqlx::{Postgres, Transaction};
@@ -15,15 +12,17 @@ use crate::{
         dbutils::DBErrorHandler,
         tabular::{
             create_tabular,
-            table::{common, DbTableFormatVersion},
+            table::{common, next_row_id_as_i64, DbTableFormatVersion},
             CreateTabular, TabularType,
         },
     },
     service::{CreateTableResponse, NamespaceId, TableCreation, TableId},
 };
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn create_table(
     TableCreation {
+        warehouse_id,
         namespace_id,
         table_ident,
         table_metadata,
@@ -47,6 +46,7 @@ pub(crate) async fn create_table(
             id: table_metadata.uuid(),
             name,
             namespace_id: *namespace_id,
+            warehouse_id: *warehouse_id,
             typ: TabularType::Table,
             metadata_location,
             location: &location,
@@ -54,40 +54,79 @@ pub(crate) async fn create_table(
         transaction,
     )
     .await?;
+    let table_id = TableId::from(tabular_id);
 
-    insert_table(&table_metadata, transaction, tabular_id).await?;
+    insert_table(&table_metadata, transaction, *warehouse_id, tabular_id).await?;
 
-    common::insert_schemas(table_metadata.schemas_iter(), transaction, tabular_id).await?;
-    common::set_current_schema(table_metadata.current_schema_id(), transaction, tabular_id).await?;
-
+    common::insert_schemas(
+        table_metadata.schemas_iter(),
+        transaction,
+        warehouse_id,
+        tabular_id,
+    )
+    .await?;
+    common::set_current_schema(
+        table_metadata.current_schema_id(),
+        transaction,
+        warehouse_id,
+        tabular_id,
+    )
+    .await?;
     common::insert_partition_specs(
         table_metadata.partition_specs_iter(),
         transaction,
+        warehouse_id,
         tabular_id,
     )
     .await?;
     common::set_default_partition_spec(
         transaction,
+        warehouse_id,
         tabular_id,
         table_metadata.default_partition_spec().spec_id(),
     )
     .await?;
-
-    common::insert_snapshots(tabular_id, table_metadata.snapshots(), transaction).await?;
-    common::insert_snapshot_refs(&table_metadata, transaction).await?;
-    common::insert_snapshot_log(table_metadata.history().iter(), transaction, tabular_id).await?;
-
-    common::insert_sort_orders(table_metadata.sort_orders_iter(), transaction, tabular_id).await?;
-    common::set_default_sort_order(
-        table_metadata.default_sort_order_id(),
+    common::insert_snapshots(
+        warehouse_id,
+        tabular_id,
+        table_metadata.snapshots(),
         transaction,
+    )
+    .await?;
+    common::insert_snapshot_refs(warehouse_id, &table_metadata, transaction).await?;
+    common::insert_snapshot_log(
+        table_metadata.history().iter(),
+        transaction,
+        warehouse_id,
         tabular_id,
     )
     .await?;
 
-    common::set_table_properties(tabular_id, table_metadata.properties(), transaction).await?;
+    common::insert_sort_orders(
+        table_metadata.sort_orders_iter(),
+        transaction,
+        warehouse_id,
+        tabular_id,
+    )
+    .await?;
+    common::set_default_sort_order(
+        table_metadata.default_sort_order_id(),
+        transaction,
+        warehouse_id,
+        tabular_id,
+    )
+    .await?;
+
+    common::set_table_properties(
+        warehouse_id,
+        tabular_id,
+        table_metadata.properties(),
+        transaction,
+    )
+    .await?;
 
     common::insert_metadata_log(
+        warehouse_id,
         tabular_id,
         table_metadata.metadata_log().iter().cloned(),
         transaction,
@@ -95,13 +134,26 @@ pub(crate) async fn create_table(
     .await?;
 
     common::insert_partition_statistics(
+        warehouse_id,
         tabular_id,
         table_metadata.partition_statistics_iter(),
         transaction,
     )
     .await?;
-    common::insert_table_statistics(tabular_id, table_metadata.statistics_iter(), transaction)
-        .await?;
+    common::insert_table_statistics(
+        warehouse_id,
+        tabular_id,
+        table_metadata.statistics_iter(),
+        transaction,
+    )
+    .await?;
+    common::insert_table_encryption_keys(
+        warehouse_id,
+        table_id,
+        table_metadata.encryption_keys_iter(),
+        transaction,
+    )
+    .await?;
 
     Ok(CreateTableResponse {
         table_metadata,
@@ -151,33 +203,37 @@ async fn maybe_delete_staged_table(
 async fn insert_table(
     table_metadata: &TableMetadata,
     transaction: &mut Transaction<'_, Postgres>,
+    warehouse_id: Uuid,
     tabular_id: Uuid,
 ) -> Result<()> {
+    let next_row_id = next_row_id_as_i64(table_metadata.next_row_id())?;
     let _ = sqlx::query!(
         r#"
-        INSERT INTO "table" (table_id,
+        INSERT INTO "table" (warehouse_id,
+                             table_id,
                              table_format_version,
                              last_column_id,
                              last_sequence_number,
                              last_updated_ms,
-                             last_partition_id
+                             last_partition_id,
+                             next_row_id
                              )
         (
-            SELECT $1, $2, $3, $4, $5, $6
+            SELECT $1, $2, $3, $4, $5, $6, $7, $8
             WHERE EXISTS (SELECT 1
                 FROM active_tables
-                WHERE active_tables.table_id = $1))
+                WHERE active_tables.warehouse_id = $1
+                    AND active_tables.table_id = $2))
         RETURNING "table_id"
         "#,
+        warehouse_id,
         tabular_id,
-        match table_metadata.format_version() {
-            FormatVersion::V1 => DbTableFormatVersion::V1,
-            FormatVersion::V2 => DbTableFormatVersion::V2,
-        } as _,
+        DbTableFormatVersion::from(table_metadata.format_version()) as _,
         table_metadata.last_column_id(),
         table_metadata.last_sequence_number(),
         table_metadata.last_updated_ms(),
-        table_metadata.last_partition_id()
+        table_metadata.last_partition_id(),
+        next_row_id
     )
     .fetch_one(&mut **transaction)
     .await

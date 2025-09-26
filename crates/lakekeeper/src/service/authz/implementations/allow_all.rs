@@ -13,13 +13,24 @@ use crate::{
             CatalogWarehouseAction, ListProjectsResponse, NamespaceParent,
         },
         health::{Health, HealthExt},
-        Actor, Catalog, NamespaceId, ProjectId, RoleId, SecretStore, State, TableId, ViewId,
-        WarehouseId,
+        Actor, Catalog, NamespaceId, ProjectId, RoleId, SecretStore, ServerId, State, TableId,
+        ViewId, WarehouseId,
     },
 };
 
-#[derive(Clone, Debug, Default)]
-pub struct AllowAllAuthorizer;
+#[derive(Clone, Debug)]
+pub struct AllowAllAuthorizer {
+    pub server_id: ServerId,
+}
+
+#[cfg(test)]
+impl std::default::Default for AllowAllAuthorizer {
+    fn default() -> Self {
+        Self {
+            server_id: ServerId::new_random(),
+        }
+    }
+}
 
 #[async_trait]
 impl HealthExt for AllowAllAuthorizer {
@@ -37,6 +48,10 @@ pub(super) struct ApiDoc;
 
 #[async_trait]
 impl Authorizer for AllowAllAuthorizer {
+    fn server_id(&self) -> ServerId {
+        self.server_id
+    }
+
     fn api_doc() -> utoipa::openapi::OpenApi {
         ApiDoc::openapi()
     }
@@ -57,15 +72,18 @@ impl Authorizer for AllowAllAuthorizer {
         Ok(())
     }
 
-    async fn list_projects(&self, _metadata: &RequestMetadata) -> Result<ListProjectsResponse> {
+    async fn list_projects_impl(
+        &self,
+        _metadata: &RequestMetadata,
+    ) -> Result<ListProjectsResponse> {
         Ok(ListProjectsResponse::All)
     }
 
-    async fn can_search_users(&self, _metadata: &RequestMetadata) -> Result<bool> {
+    async fn can_search_users_impl(&self, _metadata: &RequestMetadata) -> Result<bool> {
         Ok(true)
     }
 
-    async fn is_allowed_user_action(
+    async fn is_allowed_user_action_impl(
         &self,
         _metadata: &RequestMetadata,
         _user_id: &UserId,
@@ -74,7 +92,7 @@ impl Authorizer for AllowAllAuthorizer {
         Ok(true)
     }
 
-    async fn is_allowed_role_action(
+    async fn is_allowed_role_action_impl(
         &self,
         _metadata: &RequestMetadata,
         _role_id: RoleId,
@@ -83,7 +101,7 @@ impl Authorizer for AllowAllAuthorizer {
         Ok(true)
     }
 
-    async fn is_allowed_server_action(
+    async fn is_allowed_server_action_impl(
         &self,
         _metadata: &RequestMetadata,
         _action: CatalogServerAction,
@@ -91,7 +109,7 @@ impl Authorizer for AllowAllAuthorizer {
         Ok(true)
     }
 
-    async fn is_allowed_project_action(
+    async fn is_allowed_project_action_impl(
         &self,
         _metadata: &RequestMetadata,
         _project_id: &ProjectId,
@@ -100,7 +118,7 @@ impl Authorizer for AllowAllAuthorizer {
         Ok(true)
     }
 
-    async fn is_allowed_warehouse_action(
+    async fn is_allowed_warehouse_action_impl(
         &self,
         _metadata: &RequestMetadata,
         _warehouse_id: WarehouseId,
@@ -109,7 +127,7 @@ impl Authorizer for AllowAllAuthorizer {
         Ok(true)
     }
 
-    async fn is_allowed_namespace_action<A>(
+    async fn is_allowed_namespace_action_impl<A>(
         &self,
         _metadata: &RequestMetadata,
         _namespace_id: NamespaceId,
@@ -121,9 +139,10 @@ impl Authorizer for AllowAllAuthorizer {
         Ok(true)
     }
 
-    async fn is_allowed_table_action<A>(
+    async fn is_allowed_table_action_impl<A>(
         &self,
         _metadata: &RequestMetadata,
+        _warehouse_id: WarehouseId,
         _table_id: TableId,
         _action: A,
     ) -> Result<bool>
@@ -133,9 +152,10 @@ impl Authorizer for AllowAllAuthorizer {
         Ok(true)
     }
 
-    async fn is_allowed_view_action<A>(
+    async fn is_allowed_view_action_impl<A>(
         &self,
         _metadata: &RequestMetadata,
+        _warehouse_id: WarehouseId,
         _view_id: ViewId,
         _action: A,
     ) -> Result<bool>
@@ -215,26 +235,28 @@ impl Authorizer for AllowAllAuthorizer {
     async fn create_table(
         &self,
         _metadata: &RequestMetadata,
+        _warehouse_id: WarehouseId,
         _table_id: TableId,
         _parent: NamespaceId,
     ) -> Result<()> {
         Ok(())
     }
 
-    async fn delete_table(&self, _table_id: TableId) -> Result<()> {
+    async fn delete_table(&self, _warehouse_id: WarehouseId, _table_id: TableId) -> Result<()> {
         Ok(())
     }
 
     async fn create_view(
         &self,
         _metadata: &RequestMetadata,
+        _warehouse_id: WarehouseId,
         _view_id: ViewId,
         _parent: NamespaceId,
     ) -> Result<()> {
         Ok(())
     }
 
-    async fn delete_view(&self, _view_id: ViewId) -> Result<()> {
+    async fn delete_view(&self, _warehouse_id: WarehouseId, _view_id: ViewId) -> Result<()> {
         Ok(())
     }
 }

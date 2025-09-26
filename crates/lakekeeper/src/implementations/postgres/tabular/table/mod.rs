@@ -15,8 +15,8 @@ pub(crate) use create::create_table;
 use http::StatusCode;
 use iceberg::{
     spec::{
-        BlobMetadata, FormatVersion, PartitionSpec, Parts, Schema, SchemaId, SnapshotRetention,
-        SortOrder, Summary, MAIN_BRANCH,
+        BlobMetadata, EncryptedKey, FormatVersion, PartitionSpec, Schema, SchemaId,
+        SnapshotRetention, SortOrder, Summary, MAIN_BRANCH,
     },
     TableUpdate,
 };
@@ -46,6 +46,66 @@ use crate::{
 
 const MAX_PARAMETERS: usize = 30000;
 
+#[inline]
+pub(crate) fn next_row_id_as_i64(next_row_id: u64) -> std::result::Result<i64, ErrorModel> {
+    let next_row_id = i64::try_from(next_row_id).map_err(|e| {
+        ErrorModel::bad_request(
+            format!("Table next_row_id is {next_row_id} but must be between 0 and i64::MAX"),
+            "NextRowIdOverflow",
+            Some(Box::new(e)),
+        )
+    })?;
+    Ok(next_row_id)
+}
+
+#[inline]
+pub(crate) fn first_row_id_as_i64(first_row_id: u64) -> std::result::Result<i64, ErrorModel> {
+    let first_row_id = i64::try_from(first_row_id).map_err(|e| {
+        ErrorModel::bad_request(
+            format!("Snapshot first_row_id is {first_row_id} but must be between 0 and i64::MAX"),
+            "FirstRowIdOverflow",
+            Some(Box::new(e)),
+        )
+    })?;
+    Ok(first_row_id)
+}
+
+#[inline]
+pub(crate) fn assigned_rows_as_i64(assigned_rows: u64) -> std::result::Result<i64, ErrorModel> {
+    let assigned_rows = i64::try_from(assigned_rows).map_err(|e| {
+        ErrorModel::bad_request(
+            format!("Snapshot assigned_rows (added_rows) is {assigned_rows} but must be between 0 and i64::MAX"),
+            "AssignedRowsOverflow",
+            Some(Box::new(e)),
+        )
+    })?;
+    Ok(assigned_rows)
+}
+
+#[inline]
+pub(crate) fn first_row_id_as_u64(first_row_id: i64) -> std::result::Result<u64, ErrorModel> {
+    let first_row_id = u64::try_from(first_row_id).map_err(|e| {
+        ErrorModel::bad_request(
+            format!("Snapshot first_row_id is {first_row_id} but must be between 0 and u64::MAX"),
+            "FirstRowIdOutOfRange",
+            Some(Box::new(e)),
+        )
+    })?;
+    Ok(first_row_id)
+}
+
+#[inline]
+pub(crate) fn assigned_rows_as_u64(assigned_rows: i64) -> std::result::Result<u64, ErrorModel> {
+    let assigned_rows = u64::try_from(assigned_rows).map_err(|e| {
+        ErrorModel::bad_request(
+            format!("Snapshot assigned_rows (added_rows) is {assigned_rows} but must be between 0 and u64::MAX"),
+            "AssignedRowsOutOfRange",
+            Some(Box::new(e)),
+        )
+    })?;
+    Ok(assigned_rows)
+}
+
 pub(crate) async fn resolve_table_ident<'e, 'c: 'e, E>(
     warehouse_id: WarehouseId,
     table: &TableIdent,
@@ -64,7 +124,8 @@ where
     .await?
     .map(|(id, location)| match id {
         TabularId::Table(tab) => Ok(TabularDetails {
-            table_id: tab.into(),
+            warehouse_id,
+            table_id: tab,
             location,
         }),
         TabularId::View(_) => Err(ErrorModel::builder()
@@ -118,6 +179,8 @@ pub enum DbTableFormatVersion {
     V1,
     #[sqlx(rename = "2")]
     V2,
+    #[sqlx(rename = "3")]
+    V3,
 }
 
 impl From<DbTableFormatVersion> for FormatVersion {
@@ -125,6 +188,17 @@ impl From<DbTableFormatVersion> for FormatVersion {
         match v {
             DbTableFormatVersion::V1 => FormatVersion::V1,
             DbTableFormatVersion::V2 => FormatVersion::V2,
+            DbTableFormatVersion::V3 => FormatVersion::V3,
+        }
+    }
+}
+
+impl From<FormatVersion> for DbTableFormatVersion {
+    fn from(v: FormatVersion) -> Self {
+        match v {
+            FormatVersion::V1 => DbTableFormatVersion::V1,
+            FormatVersion::V2 => DbTableFormatVersion::V2,
+            FormatVersion::V3 => DbTableFormatVersion::V3,
         }
     }
 }
@@ -153,7 +227,7 @@ where
     tabulars.map::<TableId, TableInfo>(
         |k| match k {
             TabularId::Table(t) => {
-                let r: Result<TableId> = Ok(TableId::from(t));
+                let r: Result<TableId> = Ok(t);
                 r
             }
             TabularId::View(_) => Err(ErrorModel::internal(
@@ -170,8 +244,6 @@ where
 #[expect(dead_code)]
 #[derive(sqlx::FromRow)]
 struct TableQueryStruct {
-    // TODO: clean up the options below once we've released this and can assume that migrations
-    //       have happened
     table_id: Uuid,
     table_name: String,
     namespace_name: Vec<String>,
@@ -193,6 +265,9 @@ struct TableQueryStruct {
     snapshot_summary: Option<Vec<Json<Summary>>>,
     snapshot_schema_id: Option<Vec<Option<i32>>>,
     snapshot_timestamp_ms: Option<Vec<i64>>,
+    snapshot_first_row_ids: Option<Vec<Option<i64>>>,
+    snapshot_assigned_rows: Option<Vec<Option<i64>>>,
+    snapshot_key_ids: Option<Vec<Option<String>>>,
     metadata_location: Option<String>,
     table_fs_location: String,
     table_fs_protocol: String,
@@ -206,11 +281,12 @@ struct TableQueryStruct {
     current_schema: Option<i32>,
     schemas: Option<Vec<Json<Schema>>>,
     schema_ids: Option<Vec<i32>>,
-    table_format_version: Option<DbTableFormatVersion>,
-    last_sequence_number: Option<i64>,
-    last_column_id: Option<i32>,
-    last_updated_ms: Option<i64>,
-    last_partition_id: Option<i32>,
+    table_format_version: DbTableFormatVersion,
+    next_row_id: i64,
+    last_sequence_number: i64,
+    last_column_id: i32,
+    last_updated_ms: i64,
+    last_partition_id: i32,
     partition_stats_snapshot_ids: Option<Vec<i64>>,
     partition_stats_statistics_paths: Option<Vec<String>>,
     partition_stats_file_size_in_bytes: Option<Vec<i64>>,
@@ -220,35 +296,45 @@ struct TableQueryStruct {
     table_stats_file_footer_size_in_bytes: Option<Vec<i64>>,
     table_stats_key_metadata: Option<Vec<Option<String>>>,
     table_stats_blob_metadata: Option<Vec<Json<Vec<BlobMetadata>>>>,
+    encryption_key_ids: Option<Vec<String>>,
+    encryption_encrypted_key_metadatas: Option<Vec<Vec<u8>>>,
+    encryption_encrypted_by_ids: Option<Vec<Option<String>>>,
+    encryption_properties: Option<Vec<Option<serde_json::Value>>>,
 }
 
 impl TableQueryStruct {
     #[expect(clippy::too_many_lines)]
-    fn into_table_metadata(self) -> Result<Option<TableMetadata>> {
-        macro_rules! expect {
-            ($e:expr) => {
-                match $e {
-                    Some(v) => v,
-                    None => return Ok(None),
-                }
-            };
+    fn into_table_metadata(self) -> Result<TableMetadata> {
+        fn expect<T>(field: Option<T>, field_name: &str) -> Result<T, ErrorModel> {
+            if let Some(v) = field {
+                Ok(v)
+            } else {
+                Err(ErrorModel::internal(
+                    format!("Did not find any {field_name} for table"),
+                    "InternalMissingRequiredField",
+                    None,
+                ))
+            }
         }
-        let schemas = expect!(self.schemas)
+
+        let schemas = expect(self.schemas, "Schemas")?
             .into_iter()
             .map(|s| (s.0.schema_id(), Arc::new(s.0)))
             .collect::<HashMap<SchemaId, _>>();
 
-        let partition_specs = expect!(self.partition_spec_ids)
+        let partition_specs = expect(self.partition_spec_ids, "Partition Specs")?
             .into_iter()
             .zip(
-                expect!(self.partition_specs)
+                expect(self.partition_specs, "Partition Specs")?
                     .into_iter()
                     .map(|s| Arc::new(s.0)),
             )
             .collect::<HashMap<_, _>>();
 
+        let default_partition_spec_id =
+            expect(self.default_partition_spec_id, "Default Partition Spec ID")?;
         let default_spec = partition_specs
-            .get(&expect!(self.default_partition_spec_id))
+            .get(&default_partition_spec_id)
             .ok_or(ErrorModel::internal(
                 "Default partition spec not found",
                 "InternalDefaultPartitionSpecNotFound",
@@ -271,10 +357,24 @@ impl TableQueryStruct {
             self.snapshot_parent_snapshot_id.unwrap_or_default(),
             self.snapshot_sequence_number.unwrap_or_default(),
             self.snapshot_timestamp_ms.unwrap_or_default(),
+            self.snapshot_first_row_ids.unwrap_or_default(),
+            self.snapshot_assigned_rows.unwrap_or_default(),
+            self.snapshot_key_ids.unwrap_or_default(),
         ))
         .map(
-            |(snap_id, schema_id, summary, manifest, parent_snap, seq, timestamp_ms)| {
-                (
+            |(
+                snap_id,
+                schema_id,
+                summary,
+                manifest,
+                parent_snap,
+                seq,
+                timestamp_ms,
+                first_row_id,
+                assigned_rows,
+                key_id,
+            )| {
+                Ok((
                     snap_id,
                     Arc::new({
                         let builder = iceberg::spec::Snapshot::builder()
@@ -283,17 +383,32 @@ impl TableQueryStruct {
                             .with_sequence_number(seq)
                             .with_snapshot_id(snap_id)
                             .with_summary(summary.0)
-                            .with_timestamp_ms(timestamp_ms);
-                        if let Some(schema_id) = schema_id {
-                            builder.with_schema_id(schema_id).build()
+                            .with_timestamp_ms(timestamp_ms)
+                            .with_encryption_key_id(key_id);
+                        let row_range = if let (Some(first_row_id), Some(assigned_rows)) =
+                            (first_row_id, assigned_rows)
+                        {
+                            let first_row_id = first_row_id_as_u64(first_row_id)?;
+                            let assigned_rows = assigned_rows_as_u64(assigned_rows)?;
+                            Some((first_row_id, assigned_rows))
                         } else {
-                            builder.build()
+                            None
+                        };
+
+                        match (schema_id, row_range) {
+                            (Some(sid), Some(rr)) => builder
+                                .with_schema_id(sid)
+                                .with_row_range(rr.0, rr.1)
+                                .build(),
+                            (Some(sid), None) => builder.with_schema_id(sid).build(),
+                            (None, Some(rr)) => builder.with_row_range(rr.0, rr.1).build(),
+                            (None, None) => builder.build(),
                         }
                     }),
-                )
+                ))
             },
         )
-        .collect::<_>();
+        .collect::<Result<HashMap<_, _>>>()?;
 
         let snapshot_log = itertools::multizip((
             self.snapshot_log_ids.unwrap_or_default(),
@@ -315,10 +430,12 @@ impl TableQueryStruct {
         })
         .collect::<Vec<_>>();
 
-        let sort_orders =
-            itertools::multizip((expect!(self.sort_order_ids), expect!(self.sort_orders)))
-                .map(|(sort_order_id, sort_order)| (sort_order_id, Arc::new(sort_order.0)))
-                .collect::<HashMap<_, _>>();
+        let sort_orders = itertools::multizip((
+            expect(self.sort_order_ids, "Sort Order IDs")?,
+            expect(self.sort_orders, "Sort Orders")?,
+        ))
+        .map(|(sort_order_id, sort_order)| (sort_order_id, Arc::new(sort_order.0)))
+        .collect::<HashMap<_, _>>();
 
         let refs = itertools::multizip((
             self.table_ref_names.unwrap_or_default(),
@@ -388,38 +505,107 @@ impl TableQueryStruct {
         )
         .collect::<HashMap<_, _>>();
 
-        Ok(Some(
-            TableMetadata::try_from_parts(Parts {
-                format_version: FormatVersion::from(expect!(self.table_format_version)),
-                table_uuid: self.table_id,
-                location: join_location(&self.table_fs_protocol, &self.table_fs_location),
-                last_sequence_number: expect!(self.last_sequence_number),
-                last_updated_ms: expect!(self.last_updated_ms),
-                last_column_id: expect!(self.last_column_id),
-                schemas,
-                current_schema_id: expect!(self.current_schema),
-                partition_specs,
-                default_spec,
-                last_partition_id: expect!(self.last_partition_id),
-                properties,
-                current_snapshot_id,
-                snapshots,
-                snapshot_log,
-                metadata_log,
-                sort_orders,
-                default_sort_order_id: expect!(self.default_sort_order_id),
-                refs,
-                partition_statistics,
-                statistics,
-            })
+        let current_schema_id = self.current_schema.ok_or_else(|| {
+            ErrorModel::internal(
+                "Current schema not set for table",
+                "InternalCurrentSchemaNotSet",
+                None,
+            )
+        })?;
+
+        let default_partition_type = default_spec
+            .partition_type(schemas.get(&current_schema_id).ok_or_else(|| {
+                ErrorModel::internal(
+                    format!(
+                        "No schema exists with the current schema id {current_schema_id} in DB."
+                    ),
+                    "InternalCurrentSchemaNotFound",
+                    None,
+                )
+            })?)
             .map_err(|e| {
                 ErrorModel::internal(
-                    "Error parsing table metadata from DB",
-                    "InternalTableMetadataParseError",
+                    "Error re-creating default partition type after DB load",
+                    "InternalDefaultPartitionTypeError",
                     Some(Box::new(e)),
                 )
-            })?,
+            })?;
+
+        let next_row_id = u64::try_from(self.next_row_id).map_err(|e| {
+            ErrorModel::internal(
+                format!(
+                    "Error converting next_row_id to u64. Got: {}",
+                    self.next_row_id
+                ),
+                "InternalNextRowIdConversionError",
+                Some(Box::new(e)),
+            )
+        })?;
+
+        let encryption_keys = itertools::multizip((
+            self.encryption_key_ids.unwrap_or_default(),
+            self.encryption_encrypted_key_metadatas.unwrap_or_default(),
+            self.encryption_encrypted_by_ids.unwrap_or_default(),
+            self.encryption_properties.unwrap_or_default(),
         ))
+        .map(
+            |(key_id, encrypted_key_metadata, encrypted_by_id, properties)| {
+                let properties = properties
+                    .and_then(|p| serde_json::from_value::<HashMap<String, String>>(p).ok())
+                    .unwrap_or_default();
+                let encrypted_key = EncryptedKey::builder()
+                    .key_id(key_id.clone())
+                    .encrypted_key_metadata(encrypted_key_metadata)
+                    .properties(properties);
+                let encrypted_key = if let Some(encrypted_by_id) = encrypted_by_id {
+                    encrypted_key.encrypted_by_id(encrypted_by_id).build()
+                } else {
+                    encrypted_key.build()
+                };
+                (key_id, encrypted_key)
+            },
+        )
+        .collect::<HashMap<_, _>>();
+
+        let mut table_metadata = TableMetadata::builder()
+            .format_version(FormatVersion::from(self.table_format_version))
+            .table_uuid(self.table_id)
+            .location(join_location(
+                &self.table_fs_protocol,
+                &self.table_fs_location,
+            ))
+            .last_sequence_number(self.last_sequence_number)
+            .last_updated_ms(self.last_updated_ms)
+            .last_column_id(self.last_column_id)
+            .schemas(schemas)
+            .current_schema_id(current_schema_id)
+            .partition_specs(partition_specs)
+            .default_spec(default_spec)
+            .default_partition_type(default_partition_type)
+            .last_partition_id(self.last_partition_id)
+            .properties(properties)
+            .current_snapshot_id(current_snapshot_id)
+            .snapshots(snapshots)
+            .snapshot_log(snapshot_log)
+            .metadata_log(metadata_log)
+            .sort_orders(sort_orders)
+            .default_sort_order_id(expect(self.default_sort_order_id, "Default Sort Order ID")?)
+            .refs(refs)
+            .partition_statistics(partition_statistics)
+            .statistics(statistics)
+            .encryption_keys(encryption_keys)
+            .next_row_id(next_row_id)
+            .build_unchecked();
+
+        table_metadata.try_normalize().map_err(|e| {
+            ErrorModel::internal(
+                "Error parsing table metadata from DB",
+                "InternalTableMetadataParseError",
+                Some(Box::new(e)),
+            )
+        })?;
+
+        Ok(table_metadata)
     }
 }
 
@@ -433,10 +619,9 @@ pub(crate) async fn load_storage_profile(
         SELECT w.storage_secret_id,
         w.storage_profile as "storage_profile: Json<StorageProfile>"
         FROM "table" t
-        INNER JOIN tabular ti ON t.table_id = ti.tabular_id
-        INNER JOIN namespace n ON ti.namespace_id = n.namespace_id
-        INNER JOIN warehouse w ON n.warehouse_id = w.warehouse_id
-        WHERE w.warehouse_id = $1
+        INNER JOIN tabular ti ON t.table_id = ti.tabular_id AND t.warehouse_id = ti.warehouse_id
+        INNER JOIN warehouse w ON w.warehouse_id = $1
+        WHERE w.warehouse_id = $1 AND t.warehouse_id = $1
             AND t."table_id" = $2
             AND w.status = 'active'
         "#,
@@ -472,6 +657,7 @@ pub(crate) async fn load_tables(
             t.last_updated_ms,
             t.last_partition_id,
             t.table_format_version as "table_format_version: DbTableFormatVersion",
+            t.next_row_id,
             ti.name as "table_name",
             ti.fs_location as "table_fs_location",
             ti.fs_protocol as "table_fs_protocol",
@@ -491,6 +677,9 @@ pub(crate) async fn load_tables(
             tsnap.timestamp as "snapshot_timestamp_ms",
             tsnap.summaries as "snapshot_summary: Vec<Json<Summary>>",
             tsnap.schema_ids as "snapshot_schema_id: Vec<Option<i32>>",
+            tsnap.first_row_ids as "snapshot_first_row_ids: Vec<Option<i64>>",
+            tsnap.assigned_rows as "snapshot_assigned_rows: Vec<Option<i64>>",
+            tsnap.key_id as "snapshot_key_ids: Vec<Option<String>>",
             tdsort.sort_order_id as "default_sort_order_id?",
             tps.partition_spec_id as "partition_spec_ids",
             tps.partition_spec as "partition_specs: Vec<Json<PartitionSpec>>",
@@ -513,28 +702,35 @@ pub(crate) async fn load_tables(
             tstat.file_size_in_bytes_s as "table_stats_file_size_in_bytes",
             tstat.file_footer_size_in_bytes_s as "table_stats_file_footer_size_in_bytes",
             tstat.key_metadatas as "table_stats_key_metadata: Vec<Option<String>>",
-            tstat.blob_metadatas as "table_stats_blob_metadata: Vec<Json<Vec<BlobMetadata>>>"
+            tstat.blob_metadatas as "table_stats_blob_metadata: Vec<Json<Vec<BlobMetadata>>>",
+            tenc.key_ids as "encryption_key_ids",
+            tenc.encrypted_key_metadatas as "encryption_encrypted_key_metadatas",
+            tenc.encrypted_by_ids as "encryption_encrypted_by_ids: Vec<Option<String>>",
+            tenc.properties as "encryption_properties: Vec<Option<serde_json::Value>>"
         FROM "table" t
-        INNER JOIN tabular ti ON t.table_id = ti.tabular_id
-        INNER JOIN namespace n ON ti.namespace_id = n.namespace_id
-        INNER JOIN warehouse w ON n.warehouse_id = w.warehouse_id
-        INNER JOIN table_current_schema tcs ON tcs.table_id = t.table_id
-        LEFT JOIN table_default_partition_spec tdps ON tdps.table_id = t.table_id
-        LEFT JOIN table_default_sort_order tdsort ON tdsort.table_id = t.table_id
+        INNER JOIN tabular ti ON ti.warehouse_id = $1 AND t.table_id = ti.tabular_id
+        INNER JOIN namespace n ON ti.namespace_id = n.namespace_id AND n.warehouse_id = $1
+        INNER JOIN warehouse w ON w.warehouse_id = $1
+        INNER JOIN table_current_schema tcs
+            ON tcs.warehouse_id = $1 AND tcs.table_id = t.table_id
+        LEFT JOIN table_default_partition_spec tdps
+            ON tdps.warehouse_id = $1 AND tdps.table_id = t.table_id
+        LEFT JOIN table_default_sort_order tdsort
+            ON tdsort.warehouse_id = $1 AND tdsort.table_id = t.table_id
         LEFT JOIN (SELECT table_id,
                           ARRAY_AGG(schema_id) as schema_ids,
                           ARRAY_AGG(schema) as schemas
-                   FROM table_schema WHERE table_id = ANY($2)
+                   FROM table_schema WHERE warehouse_id = $1 AND table_id = ANY($2)
                    GROUP BY table_id) ts ON ts.table_id = t.table_id
         LEFT JOIN (SELECT table_id,
                           ARRAY_AGG(partition_spec) as partition_spec,
                           ARRAY_AGG(partition_spec_id) as partition_spec_id
-                   FROM table_partition_spec WHERE table_id = ANY($2)
+                   FROM table_partition_spec WHERE warehouse_id = $1 AND table_id = ANY($2)
                    GROUP BY table_id) tps ON tps.table_id = t.table_id
         LEFT JOIN (SELECT table_id,
                             ARRAY_AGG(key) as keys,
                             ARRAY_AGG(value) as values
-                     FROM table_properties WHERE table_id = ANY($2)
+                     FROM table_properties WHERE warehouse_id = $1 AND table_id = ANY($2)
                      GROUP BY table_id) tp ON tp.table_id = t.table_id
         LEFT JOIN (SELECT table_id,
                           ARRAY_AGG(snapshot_id) as snapshot_ids,
@@ -543,35 +739,38 @@ pub(crate) async fn load_tables(
                           ARRAY_AGG(manifest_list) as manifest_lists,
                           ARRAY_AGG(summary) as summaries,
                           ARRAY_AGG(schema_id) as schema_ids,
-                          ARRAY_AGG(timestamp_ms) as timestamp
-                   FROM table_snapshot WHERE table_id = ANY($2)
+                          ARRAY_AGG(timestamp_ms) as timestamp,
+                          ARRAY_AGG(first_row_id) as first_row_ids,
+                          ARRAY_AGG(assigned_rows) as assigned_rows,
+                          ARRAY_AGG(key_id) as key_id
+                   FROM table_snapshot WHERE warehouse_id = $1 AND table_id = ANY($2)
                    GROUP BY table_id) tsnap ON tsnap.table_id = t.table_id
         LEFT JOIN (SELECT table_id,
                           ARRAY_AGG(snapshot_id ORDER BY sequence_number) as snapshot_ids,
                           ARRAY_AGG(timestamp ORDER BY sequence_number) as timestamps
-                     FROM table_snapshot_log WHERE table_id = ANY($2)
+                     FROM table_snapshot_log WHERE warehouse_id = $1 AND table_id = ANY($2)
                      GROUP BY table_id) tsl ON tsl.table_id = t.table_id
         LEFT JOIN (SELECT table_id,
                           ARRAY_AGG(timestamp ORDER BY sequence_number) as timestamps,
                           ARRAY_AGG(metadata_file ORDER BY sequence_number) as metadata_files
-                   FROM table_metadata_log WHERE table_id = ANY($2)
+                   FROM table_metadata_log WHERE warehouse_id = $1 AND table_id = ANY($2)
                    GROUP BY table_id) tml ON tml.table_id = t.table_id
         LEFT JOIN (SELECT table_id,
                           ARRAY_AGG(sort_order_id) as sort_order_ids,
                           ARRAY_AGG(sort_order) as sort_orders
-                     FROM table_sort_order WHERE table_id = ANY($2)
+                     FROM table_sort_order WHERE warehouse_id = $1 AND table_id = ANY($2)
                      GROUP BY table_id) tso ON tso.table_id = t.table_id
         LEFT JOIN (SELECT table_id,
                           ARRAY_AGG(table_ref_name) as table_ref_names,
                           ARRAY_AGG(snapshot_id) as snapshot_ids,
                           ARRAY_AGG(retention) as retentions
-                   FROM table_refs WHERE table_id = ANY($2)
+                   FROM table_refs WHERE warehouse_id = $1 AND table_id = ANY($2)
                    GROUP BY table_id) tr ON tr.table_id = t.table_id
         LEFT JOIN (SELECT table_id,
                           ARRAY_AGG(snapshot_id) as snapshot_ids,
                           ARRAY_AGG(statistics_path) as statistics_paths,
                           ARRAY_AGG(file_size_in_bytes) as file_size_in_bytes_s
-                    FROM partition_statistics WHERE table_id = ANY($2)
+                    FROM partition_statistics WHERE warehouse_id = $1 AND table_id = ANY($2)
                     GROUP BY table_id) pstat ON pstat.table_id = t.table_id
         LEFT JOIN (SELECT table_id,
                           ARRAY_AGG(snapshot_id) as snapshot_ids,
@@ -580,9 +779,19 @@ pub(crate) async fn load_tables(
                           ARRAY_AGG(file_footer_size_in_bytes) as file_footer_size_in_bytes_s,
                           ARRAY_AGG(key_metadata) as key_metadatas,
                           ARRAY_AGG(blob_metadata) as blob_metadatas
-                    FROM table_statistics WHERE table_id = ANY($2)
+                    FROM table_statistics WHERE warehouse_id = $1 AND table_id = ANY($2)
                     GROUP BY table_id) tstat ON tstat.table_id = t.table_id
-        WHERE w.warehouse_id = $1
+        LEFT JOIN (
+            SELECT table_id,
+                   ARRAY_AGG(key_id) as key_ids,
+                   ARRAY_AGG(encrypted_key_metadata) as encrypted_key_metadatas,
+                   ARRAY_AGG(encrypted_by_id) as encrypted_by_ids,
+                   ARRAY_AGG(properties) as properties
+            FROM table_encryption_keys
+            WHERE warehouse_id = $1 AND table_id = ANY($2)
+            GROUP BY table_id
+        ) tenc ON tenc.table_id = t.table_id
+        WHERE t.warehouse_id = $1
             AND w.status = 'active'
             AND (ti.deleted_at IS NULL OR $3)
             AND t."table_id" = ANY($2)
@@ -593,10 +802,9 @@ pub(crate) async fn load_tables(
     )
     .fetch_all(&mut **transaction)
     .await
-    .unwrap();
+    .map_err(|e| e.into_error_model("Error fetching tables".to_string()))?;
 
     let mut tables = HashMap::new();
-    let mut failed_to_fetch = HashSet::new();
     for table in table {
         let table_id = table.table_id.into();
         let metadata_location = match table
@@ -619,13 +827,7 @@ pub(crate) async fn load_tables(
         let storage_secret_ident = table.storage_secret_id.map(SecretIdent::from);
         let storage_profile = table.storage_profile.deref().clone();
 
-        let Some(table_metadata) = table.into_table_metadata()? else {
-            tracing::warn!(
-                "Table metadata could not be fetched from tables, falling back to blob retrieval."
-            );
-            failed_to_fetch.insert(table_id);
-            continue;
-        };
+        let table_metadata = table.into_table_metadata()?;
 
         tables.insert(
             table_id,
@@ -639,19 +841,6 @@ pub(crate) async fn load_tables(
             },
         );
     }
-
-    for t in table_ids {
-        if !tables.contains_key(&((*t).into())) {
-            failed_to_fetch.insert((*t).into());
-        }
-    }
-    if !failed_to_fetch.is_empty() {
-        tracing::error!(
-            "Failed to fetch the following tables: '{:?}'",
-            failed_to_fetch
-        );
-    }
-
     Ok(tables)
 }
 
@@ -670,15 +859,14 @@ pub(crate) async fn get_table_metadata_by_id(
             ti.fs_protocol as "table_fs_protocol",
             namespace_name,
             ti.namespace_id,
-            t."metadata" as "metadata: Json<TableMetadata>",
             ti."metadata_location",
             w.storage_profile as "storage_profile: Json<StorageProfile>",
             w."storage_secret_id"
         FROM "table" t
-        INNER JOIN tabular ti ON t.table_id = ti.tabular_id
-        INNER JOIN namespace n ON ti.namespace_id = n.namespace_id
-        INNER JOIN warehouse w ON n.warehouse_id = w.warehouse_id
-        WHERE w.warehouse_id = $1 AND t."table_id" = $2
+        INNER JOIN tabular ti ON ti.warehouse_id = $1 AND t.table_id = ti.tabular_id
+        INNER JOIN namespace n ON ti.namespace_id = n.namespace_id AND n.warehouse_id = $1
+        INNER JOIN warehouse w ON w.warehouse_id = $1
+        WHERE t.warehouse_id = $1 AND t."table_id" = $2
             AND w.status = 'active'
             AND (ti.deleted_at IS NULL OR $3)
         "#,
@@ -739,15 +927,14 @@ pub(crate) async fn get_table_metadata_by_s3_location(
              ti.fs_location as "fs_location",
              namespace_name,
              ti.namespace_id,
-             t."metadata" as "metadata: Json<TableMetadata>",
              ti."metadata_location",
              w.storage_profile as "storage_profile: Json<StorageProfile>",
              w."storage_secret_id"
          FROM "table" t
-         INNER JOIN tabular ti ON t.table_id = ti.tabular_id
-         INNER JOIN namespace n ON ti.namespace_id = n.namespace_id
-         INNER JOIN warehouse w ON n.warehouse_id = w.warehouse_id
-         WHERE w.warehouse_id = $1
+         INNER JOIN tabular ti ON t.warehouse_id = $1 AND t.table_id = ti.tabular_id
+         INNER JOIN namespace n ON ti.namespace_id = n.namespace_id AND n.warehouse_id = $1
+         INNER JOIN warehouse w ON w.warehouse_id = $1
+         WHERE t.warehouse_id = $1
              AND ti.fs_location = ANY($2)
              AND LENGTH(ti.fs_location) <= $3
              AND w.status = 'active'
@@ -806,7 +993,7 @@ pub(crate) async fn rename_table(
 ) -> Result<()> {
     crate::implementations::postgres::tabular::rename_tabular(
         warehouse_id,
-        TabularId::Table(*source_id),
+        TabularId::Table(source_id),
         source,
         destination,
         transaction,
@@ -817,23 +1004,31 @@ pub(crate) async fn rename_table(
 }
 
 pub(crate) async fn drop_table(
+    warehouse_id: WarehouseId,
     table_id: TableId,
     force: bool,
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<String> {
-    drop_tabular(TabularId::Table(*table_id), force, None, transaction).await
+    drop_tabular(
+        warehouse_id,
+        TabularId::Table(table_id),
+        force,
+        None,
+        transaction,
+    )
+    .await
 }
 
 #[derive(Default)]
 #[allow(clippy::struct_excessive_bools)]
-struct TableUpdates {
+struct TableUpdateFlags {
     snapshot_refs: bool,
     properties: bool,
 }
 
-impl From<&[TableUpdate]> for TableUpdates {
+impl From<&[TableUpdate]> for TableUpdateFlags {
     fn from(value: &[TableUpdate]) -> Self {
-        let mut s = TableUpdates::default();
+        let mut s = TableUpdateFlags::default();
         for u in value {
             match u {
                 TableUpdate::RemoveSnapshotRef { .. } | TableUpdate::SetSnapshotRef { .. } => {
@@ -851,7 +1046,7 @@ impl From<&[TableUpdate]> for TableUpdates {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    // Desired behaviour:
+    // Desired behavior:
     // - Stage-Create => Load fails with 404
     // - No Stage-Create => Next create fails with 409, load succeeds
     // - Stage-Create => Next stage-create works & overwrites
@@ -885,9 +1080,10 @@ pub(crate) mod tests {
         },
         service::{
             task_queue::{
-                tabular_expiration_queue::TabularExpirationPayload, EntityId, TaskMetadata,
+                tabular_expiration_queue::{TabularExpirationPayload, TabularExpirationTask},
+                EntityId, TaskMetadata,
             },
-            Catalog, ListFlags, NamespaceId, TableCreation,
+            ListFlags, NamedEntity, NamespaceId, TableCreation,
         },
     };
 
@@ -971,11 +1167,18 @@ pub(crate) mod tests {
         pub(crate) table_ident: TableIdent,
     }
 
+    /// Creates a table in the given warehouse.
+    ///
+    /// Parameters:
+    ///
+    /// * `namespace`: If provided creates the table in that namespace, otherwise creates new one.
+    /// * `table_id`: If provided uses this as the table's id, otherwise creates a random id.
     pub(crate) async fn initialize_table(
         warehouse_id: WarehouseId,
         state: CatalogState,
         staged: bool,
         namespace: Option<NamespaceIdent>,
+        table_id: Option<TableId>,
         table_name: Option<String>,
     ) -> InitializedTable {
         // my_namespace_<uuid>
@@ -994,7 +1197,7 @@ pub(crate) mod tests {
             namespace: namespace.clone(),
             name: request.name.clone(),
         };
-        let table_id = Uuid::now_v7().into();
+        let table_id = table_id.unwrap_or_else(|| Uuid::now_v7().into());
 
         let table_metadata = create_table_request_into_table_metadata(table_id, request).unwrap();
         let schema = table_metadata.current_schema_id();
@@ -1036,6 +1239,7 @@ pub(crate) mod tests {
             .unwrap()
             .metadata;
         let create = TableCreation {
+            warehouse_id,
             namespace_id,
             table_ident: &table_ident,
             table_metadata,
@@ -1077,6 +1281,7 @@ pub(crate) mod tests {
                 .unwrap();
 
         let request = TableCreation {
+            warehouse_id,
             namespace_id,
             table_ident: &table_ident,
             table_metadata,
@@ -1145,6 +1350,7 @@ pub(crate) mod tests {
         let table_metadata = create_table_request_into_table_metadata(table_id, request).unwrap();
 
         let request = TableCreation {
+            warehouse_id,
             namespace_id,
             table_ident: &table_ident,
             table_metadata,
@@ -1190,6 +1396,7 @@ pub(crate) mod tests {
         let table_metadata = create_table_request_into_table_metadata(table_id, request).unwrap();
 
         let request = TableCreation {
+            warehouse_id,
             namespace_id,
             table_ident: &table_ident,
             table_metadata,
@@ -1250,7 +1457,7 @@ pub(crate) mod tests {
         assert!(exists.is_none());
         drop(table_ident);
 
-        let table = initialize_table(warehouse_id, state.clone(), true, None, None).await;
+        let table = initialize_table(warehouse_id, state.clone(), true, None, None, None).await;
 
         // Table is staged - no result if include_staged is false
         let exists = resolve_table_ident(
@@ -1300,7 +1507,7 @@ pub(crate) mod tests {
         .unwrap();
         assert!(exists.len() == 1 && exists.get(&table_ident).unwrap().is_none());
 
-        let table_1 = initialize_table(warehouse_id, state.clone(), true, None, None).await;
+        let table_1 = initialize_table(warehouse_id, state.clone(), true, None, None, None).await;
         let mut tables = HashSet::new();
         tables.insert(&table_1.table_ident);
 
@@ -1334,7 +1541,7 @@ pub(crate) mod tests {
         );
 
         // Second Table
-        let table_2 = initialize_table(warehouse_id, state.clone(), false, None, None).await;
+        let table_2 = initialize_table(warehouse_id, state.clone(), false, None, None, None).await;
         tables.insert(&table_2.table_ident);
 
         let exists = table_idents_to_ids(
@@ -1375,11 +1582,83 @@ pub(crate) mod tests {
     }
 
     #[sqlx::test]
+    async fn test_to_ids_case_insensitivity(pool: sqlx::PgPool) {
+        let state = CatalogState::from_pools(pool.clone(), pool.clone());
+
+        let warehouse_id = initialize_warehouse(state.clone(), None, None, None, true).await;
+        let namespace_lower =
+            NamespaceIdent::from_vec(vec!["my_namespace".to_string(), "child".to_string()])
+                .unwrap();
+        let namespace_upper =
+            NamespaceIdent::from_vec(vec!["MY_NAMESPACE".to_string(), "CHILD".to_string()])
+                .unwrap();
+        initialize_namespace(state.clone(), warehouse_id, &namespace_lower, None).await;
+
+        let table_ident_lower = TableIdent {
+            namespace: namespace_lower.clone(),
+            name: "my_table".to_string(),
+        };
+        let table_ident_upper = TableIdent {
+            namespace: namespace_upper.clone(),
+            name: "MY_TABLE".to_string(),
+        };
+
+        let created = initialize_table(
+            warehouse_id,
+            state.clone(),
+            false,
+            Some(namespace_lower.clone()),
+            None,
+            Some(table_ident_lower.name.clone()),
+        )
+        .await;
+        let _ = initialize_table(
+            warehouse_id,
+            state.clone(),
+            false,
+            Some(namespace_lower.clone()),
+            None,
+            Some("a_table_not_to_be_included_in_results".to_string()),
+        )
+        .await;
+
+        // Lower idents are in db and we query upper.
+        let existing = table_idents_to_ids(
+            warehouse_id,
+            HashSet::from([&table_ident_upper]),
+            ListFlags::default(),
+            &state.read_pool(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(existing.len(), 1);
+        // The queried ident must be the key in the map.
+        assert_eq!(
+            existing.get(&table_ident_upper),
+            Some(&Some(created.table_id))
+        );
+
+        // Verify behavior of querying the same table twice with different cases.
+        let existing = table_idents_to_ids(
+            warehouse_id,
+            HashSet::from([&table_ident_lower, &table_ident_upper]),
+            ListFlags::default(),
+            &state.read_pool(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(existing.len(), 2);
+        let entry_lower = existing.get(&table_ident_lower).unwrap().unwrap();
+        let entry_upper = existing.get(&table_ident_upper).unwrap().unwrap();
+        assert_eq!(entry_lower, entry_upper);
+    }
+
+    #[sqlx::test]
     async fn test_rename_without_namespace(pool: sqlx::PgPool) {
         let state = CatalogState::from_pools(pool.clone(), pool.clone());
 
         let warehouse_id = initialize_warehouse(state.clone(), None, None, None, true).await;
-        let table = initialize_table(warehouse_id, state.clone(), false, None, None).await;
+        let table = initialize_table(warehouse_id, state.clone(), false, None, None, None).await;
 
         let new_table_ident = TableIdent {
             namespace: table.namespace.clone(),
@@ -1425,7 +1704,7 @@ pub(crate) mod tests {
         let state = CatalogState::from_pools(pool.clone(), pool.clone());
 
         let warehouse_id = initialize_warehouse(state.clone(), None, None, None, true).await;
-        let table = initialize_table(warehouse_id, state.clone(), false, None, None).await;
+        let table = initialize_table(warehouse_id, state.clone(), false, None, None, None).await;
 
         let new_namespace = NamespaceIdent::from_vec(vec!["new_namespace".to_string()]).unwrap();
         initialize_namespace(state.clone(), warehouse_id, &new_namespace, None).await;
@@ -1473,7 +1752,7 @@ pub(crate) mod tests {
         let state = CatalogState::from_pools(pool.clone(), pool.clone());
 
         let warehouse_id = initialize_warehouse(state.clone(), None, None, None, true).await;
-        let table = initialize_table(warehouse_id, state.clone(), false, None, None).await;
+        let table = initialize_table(warehouse_id, state.clone(), false, None, None, None).await;
 
         let new_namespace = NamespaceIdent::from_vec(vec!["new_namespace".to_string()]).unwrap();
 
@@ -1515,7 +1794,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(tables.len(), 0);
 
-        let table1 = initialize_table(warehouse_id, state.clone(), false, None, None).await;
+        let table1 = initialize_table(warehouse_id, state.clone(), false, None, None, None).await;
 
         let tables = list_tables(
             warehouse_id,
@@ -1532,7 +1811,7 @@ pub(crate) mod tests {
             table1.table_ident
         );
 
-        let table2 = initialize_table(warehouse_id, state.clone(), true, None, None).await;
+        let table2 = initialize_table(warehouse_id, state.clone(), true, None, None, None).await;
         let tables = list_tables(
             warehouse_id,
             &table2.namespace,
@@ -1585,6 +1864,7 @@ pub(crate) mod tests {
             state.clone(),
             false,
             Some(namespace.clone()),
+            None,
             Some("t1".into()),
         )
         .await;
@@ -1593,6 +1873,7 @@ pub(crate) mod tests {
             state.clone(),
             true,
             Some(namespace.clone()),
+            None,
             Some("t2".into()),
         )
         .await;
@@ -1601,6 +1882,7 @@ pub(crate) mod tests {
             state.clone(),
             true,
             Some(namespace.clone()),
+            None,
             Some("t3".into()),
         )
         .await;
@@ -1673,7 +1955,7 @@ pub(crate) mod tests {
         let state = CatalogState::from_pools(pool.clone(), pool.clone());
 
         let warehouse_id = initialize_warehouse(state.clone(), None, None, None, true).await;
-        let table = initialize_table(warehouse_id, state.clone(), false, None, None).await;
+        let table = initialize_table(warehouse_id, state.clone(), false, None, None, None).await;
 
         let metadata = get_table_metadata_by_id(
             warehouse_id,
@@ -1759,7 +2041,7 @@ pub(crate) mod tests {
         let state = CatalogState::from_pools(pool.clone(), pool.clone());
 
         let warehouse_id = initialize_warehouse(state.clone(), None, None, None, true).await;
-        let table = initialize_table(warehouse_id, state.clone(), false, None, None).await;
+        let table = initialize_table(warehouse_id, state.clone(), false, None, None, None).await;
         let mut transaction = pool.begin().await.expect("Failed to start transaction");
         set_warehouse_status(warehouse_id, WarehouseStatus::Inactive, &mut transaction)
             .await
@@ -1782,19 +2064,19 @@ pub(crate) mod tests {
         let state = CatalogState::from_pools(pool.clone(), pool.clone());
 
         let warehouse_id = initialize_warehouse(state.clone(), None, None, None, true).await;
-        let table = initialize_table(warehouse_id, state.clone(), false, None, None).await;
+        let table = initialize_table(warehouse_id, state.clone(), false, None, None, None).await;
 
         let mut transaction = pool.begin().await.unwrap();
 
-        let _ = PostgresCatalog::queue_tabular_expiration(
+        let _ = TabularExpirationTask::schedule_task::<PostgresCatalog>(
             TaskMetadata {
-                entity_id: EntityId::Tabular(*table.table_id),
+                entity_id: EntityId::Table(table.table_id),
                 warehouse_id,
                 parent_task_id: None,
                 schedule_for: Some(chrono::Utc::now() + chrono::Duration::seconds(1)),
+                entity_name: table.table_ident.into_name_parts(),
             },
             TabularExpirationPayload {
-                tabular_type: crate::api::management::v1::TabularType::Table,
                 deletion_kind: DeleteKind::Purge,
             },
             &mut transaction,
@@ -1803,7 +2085,8 @@ pub(crate) mod tests {
         .unwrap();
 
         mark_tabular_as_deleted(
-            TabularId::Table(*table.table_id),
+            warehouse_id,
+            TabularId::Table(table.table_id),
             false,
             None,
             &mut transaction,
@@ -1838,7 +2121,7 @@ pub(crate) mod tests {
 
         let mut transaction = pool.begin().await.unwrap();
 
-        drop_table(table.table_id, false, &mut transaction)
+        drop_table(warehouse_id, table.table_id, false, &mut transaction)
             .await
             .unwrap();
         transaction.commit().await.unwrap();

@@ -13,31 +13,30 @@ use crate::{
             },
         },
         management::v1::{
-            bootstrap::{BootstrapRequest, Service as _},
-            warehouse::{CreateWarehouseRequest, Service},
+            warehouse::{CreateWarehouseRequest, Service, TabularDeleteProfile},
             ApiServer, DeleteWarehouseQuery,
         },
     },
     catalog::CatalogServer,
     service::authz::AllowAllAuthorizer,
-    tests::{get_api_context, random_request_metadata, spawn_build_in_queues},
+    tests::{random_request_metadata, spawn_build_in_queues},
 };
 
 #[sqlx::test]
 async fn test_cannot_drop_warehouse_before_purge_tasks_completed(pool: PgPool) {
     let storage_profile = crate::tests::memory_io_profile();
-    let authorizer = AllowAllAuthorizer {};
+    let authorizer = AllowAllAuthorizer::default();
 
-    let api_context = get_api_context(&pool, authorizer);
-
-    // Bootstrap
-    ApiServer::bootstrap(
-        api_context.clone(),
-        random_request_metadata(),
-        BootstrapRequest::builder().accept_terms_of_use().build(),
+    let (api_context, _) = crate::tests::setup(
+        pool.clone(),
+        storage_profile.clone(),
+        None,
+        authorizer,
+        TabularDeleteProfile::default(),
+        None,
+        1,
     )
-    .await
-    .unwrap();
+    .await;
 
     // Create a warehouse
     let warehouse_name = format!("test_warehouse_{}", Uuid::now_v7());
@@ -105,12 +104,13 @@ async fn test_cannot_drop_warehouse_before_purge_tasks_completed(pool: PgPool) {
     .expect_err("Warehouse deletion should fail due to purge tasks");
 
     // Spawn task queue workers
-    let cancellation_token = tokio_util::sync::CancellationToken::new();
-    let queues_future = spawn_build_in_queues(
+    let cancellation_token = crate::CancellationToken::new();
+    let queues_handle = spawn_build_in_queues(
         &api_context,
         Some(std::time::Duration::from_secs(1)),
         cancellation_token.clone(),
-    );
+    )
+    .await;
 
     // Drop warehouse — poll until purge tasks complete to avoid flakiness
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -131,5 +131,5 @@ async fn test_cannot_drop_warehouse_before_purge_tasks_completed(pool: PgPool) {
         }
     }
     cancellation_token.cancel();
-    queues_future.await.unwrap();
+    queues_handle.await.unwrap();
 }

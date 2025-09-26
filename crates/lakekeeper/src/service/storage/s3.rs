@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::LazyLock};
 
 use aws_config::SdkConfig;
-use aws_sdk_sts::config::ProvideCredentials;
+use aws_sdk_sts::{config::ProvideCredentials as _, types::Tag};
 use aws_smithy_runtime_api::client::identity::Identity;
 use iceberg_ext::{
     catalog::rest::ErrorModel,
@@ -25,7 +25,10 @@ use veil::Redact;
 
 use crate::{
     api::{
-        iceberg::{supported_endpoints, v1::DataAccess},
+        iceberg::{
+            supported_endpoints,
+            v1::{tables::DataAccessMode, DataAccess},
+        },
         management::v1::warehouse::TabularDeleteProfile,
         CatalogConfig,
     },
@@ -90,6 +93,10 @@ pub struct S3Profile {
     #[builder(default = 3600)]
     #[serde(default = "fn_3600")]
     pub sts_token_validity_seconds: u64,
+    /// Optional session tags for STS assume role operations.
+    #[serde(default)]
+    #[builder(default)]
+    pub sts_session_tags: HashMap<String, String>,
     /// S3 flavor to use.
     /// Defaults to AWS
     #[serde(default)]
@@ -388,10 +395,7 @@ impl S3Profile {
     #[allow(clippy::too_many_arguments)]
     pub async fn generate_table_config(
         &self,
-        DataAccess {
-            vended_credentials,
-            remote_signing,
-        }: DataAccess,
+        data_access: DataAccessMode,
         s3_credential: Option<&S3Credential>,
         table_location: &Location,
         storage_permissions: StoragePermissions,
@@ -399,10 +403,20 @@ impl S3Profile {
         warehouse_id: WarehouseId,
         tabular_id: TabularId,
     ) -> Result<TableConfig, TableConfigError> {
-        // If vended_credentials is False and remote_signing is False,
-        // use remote_signing. This avoids generating costly STS credentials
-        // for clients that don't need them.
-        let mut remote_signing = !vended_credentials || remote_signing;
+        let (remote_signing, vended_credentials) = match data_access {
+            DataAccessMode::ServerDelegated(DataAccess {
+                vended_credentials,
+                remote_signing,
+            }) => {
+                // If vended_credentials is False and remote_signing is False,
+                // use remote_signing. This avoids generating costly STS credentials
+                // for clients that don't need them.
+                let remote_signing = !vended_credentials || remote_signing;
+                (remote_signing, vended_credentials)
+            }
+            DataAccessMode::ClientManaged => (false, false),
+        };
+        let mut remote_signing = remote_signing;
 
         let mut config = TableProperties::default();
         let mut creds = TableProperties::default();
@@ -412,7 +426,6 @@ impl S3Profile {
         }
 
         config.insert(&s3::Region(self.region.to_string()));
-        config.insert(&client::Region(self.region.to_string()));
         config.insert(&custom::CustomConfig {
             key: "region".to_string(),
             value: self.region.to_string(),
@@ -424,7 +437,7 @@ impl S3Profile {
         }
 
         if vended_credentials {
-            if self.sts_enabled | matches!(s3_credential, Some(S3Credential::CloudflareR2(..))) {
+            if self.sts_enabled || matches!(s3_credential, Some(S3Credential::CloudflareR2(..))) {
                 let aws_sdk_sts::types::Credentials {
                     access_key_id,
                     secret_access_key,
@@ -474,6 +487,9 @@ impl S3Profile {
                 creds.insert(&s3::SecretAccessKey(secret_access_key));
                 creds.insert(&s3::SessionToken(session_token));
             } else {
+                tracing::debug!(
+                    "Falling back to remote signing: vended_credentials requested but STS is disabled for this Warehouse and the credential type is not Cloudflare R2."
+                );
                 push_fsspec_fileio_with_s3v4restsigner(&mut config);
                 remote_signing = true;
             }
@@ -660,6 +676,24 @@ impl S3Profile {
             assume_role_builder.external_id(external_id)
         } else {
             assume_role_builder
+        };
+
+        let assume_role_builder = if self.sts_session_tags.is_empty() {
+            assume_role_builder
+        } else {
+            let tags: Vec<Tag> = self
+                .sts_session_tags
+                .iter()
+                .map(|(key, value)| {
+                    Tag::builder().key(key).value(value).build().map_err(|e| {
+                        CredentialsError::ShortTermCredential {
+                            reason: format!("Failed to build STS tag: {e}"),
+                            source: Some(Box::new(e)),
+                        }
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            assume_role_builder.set_tags(Some(tags))
         };
 
         let v = assume_role_builder.send().await.map_err(|e| {
@@ -1063,8 +1097,6 @@ impl TryFrom<S3Credential> for S3Auth {
 pub(crate) mod test {
     use std::str::FromStr as _;
 
-    use needs_env_var::needs_env_var;
-
     use super::*;
     use crate::service::{
         storage::{StorageLocations as _, StorageProfile},
@@ -1212,6 +1244,7 @@ pub(crate) mod test {
             path_style_access: Some(true),
             sts_role_arn: None,
             sts_enabled: false,
+            sts_session_tags: HashMap::new(),
             flavor: S3Flavor::Aws,
             allow_alternative_protocols: Some(false),
             remote_signing_url_style: S3UrlStyleDetectionMode::Auto,
@@ -1222,7 +1255,7 @@ pub(crate) mod test {
         let sp: StorageProfile = profile.clone().into();
 
         let namespace_id = NamespaceId::from(uuid::Uuid::now_v7());
-        let table_id = TabularId::Table(uuid::Uuid::now_v7());
+        let table_id = TabularId::Table(uuid::Uuid::now_v7().into());
         let namespace_location = sp.default_namespace_location(namespace_id).unwrap();
 
         let location = sp.default_tabular_location(&namespace_location, table_id);
@@ -1256,6 +1289,7 @@ pub(crate) mod test {
             path_style_access: Some(true),
             sts_role_arn: None,
             sts_enabled: false,
+            sts_session_tags: HashMap::new(),
             flavor: S3Flavor::Aws,
             allow_alternative_protocols: Some(false),
             remote_signing_url_style: S3UrlStyleDetectionMode::Auto,
@@ -1265,7 +1299,7 @@ pub(crate) mod test {
         };
 
         let namespace_location = Location::from_str("s3://test-bucket/foo/").unwrap();
-        let table_id = TabularId::Table(uuid::Uuid::now_v7());
+        let table_id = TabularId::Table(uuid::Uuid::now_v7().into());
         // Prefix should be ignored as we specify the namespace_location explicitly.
         // Tabular locations should not have a trailing slash, otherwise pyiceberg fails.
         let expected = format!("s3://test-bucket/foo/{table_id}");
@@ -1279,9 +1313,8 @@ pub(crate) mod test {
         assert_eq!(location.to_string(), expected);
     }
 
-    #[needs_env_var(TEST_MINIO = 1)]
-    pub(crate) mod s3_compat {
-        use std::sync::LazyLock;
+    pub(crate) mod minio_integration_tests {
+        use std::{collections::HashMap, sync::LazyLock};
 
         use crate::{
             api::RequestMetadata,
@@ -1311,6 +1344,7 @@ pub(crate) mod test {
                 region: TEST_REGION.clone(),
                 path_style_access: Some(true),
                 sts_role_arn: None,
+                sts_session_tags: HashMap::new(),
                 flavor: S3Flavor::S3Compat,
                 sts_enabled: true,
                 allow_alternative_protocols: Some(false),
@@ -1356,8 +1390,7 @@ pub(crate) mod test {
         }
     }
 
-    // #[needs_env_var(TEST_AWS = 1)]
-    pub(crate) mod aws {
+    pub(crate) mod aws_integration_tests {
         use super::super::*;
         use crate::service::storage::{StorageCredential, StorageProfile};
 
@@ -1370,6 +1403,7 @@ pub(crate) mod test {
                 region: std::env::var("AWS_S3_REGION").unwrap(),
                 path_style_access: Some(true),
                 sts_role_arn: Some(std::env::var("AWS_S3_STS_ROLE_ARN").unwrap()),
+                sts_session_tags: HashMap::new(),
                 flavor: S3Flavor::Aws,
                 sts_enabled: true,
                 allow_alternative_protocols: Some(false),
@@ -1451,8 +1485,7 @@ pub(crate) mod test {
         }
     }
 
-    #[needs_env_var(TEST_AWS_KMS = 1)]
-    pub(crate) mod aws_kms {
+    pub(crate) mod aws_kms_integration_tests {
         use super::super::*;
         use crate::service::storage::{StorageCredential, StorageProfile};
 
@@ -1465,6 +1498,7 @@ pub(crate) mod test {
                 region: std::env::var("AWS_S3_REGION").unwrap(),
                 path_style_access: Some(true),
                 sts_role_arn: None,
+                sts_session_tags: HashMap::new(),
                 flavor: S3Flavor::Aws,
                 sts_enabled: true,
                 allow_alternative_protocols: Some(false),
@@ -1509,8 +1543,7 @@ pub(crate) mod test {
         }
     }
 
-    #[needs_env_var(TEST_R2 = 1)]
-    pub(crate) mod r2 {
+    pub(crate) mod r2_integration_tests {
         use super::super::*;
         use crate::service::storage::{StorageCredential, StorageProfile};
 
@@ -1530,6 +1563,7 @@ pub(crate) mod test {
                 sts_role_arn: None,
                 flavor: S3Flavor::S3Compat,
                 sts_enabled: true,
+                sts_session_tags: HashMap::new(),
                 allow_alternative_protocols: Some(false),
                 remote_signing_url_style:
                     crate::service::storage::s3::S3UrlStyleDetectionMode::Auto,
@@ -1613,6 +1647,7 @@ mod is_overlapping_location_tests {
             path_style_access: None,
             sts_role_arn: None,
             sts_enabled: false,
+            sts_session_tags: HashMap::new(),
             flavor: S3Flavor::Aws,
             allow_alternative_protocols: None,
             remote_signing_url_style: S3UrlStyleDetectionMode::Auto,

@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     api::iceberg::v1::{
-        ApiContext, CommitViewRequest, DataAccess, ErrorModel, LoadViewResult, Result,
+        ApiContext, CommitViewRequest, DataAccessMode, ErrorModel, LoadViewResult, Result,
         ViewParameters,
     },
     catalog::{
@@ -42,9 +42,10 @@ pub(crate) async fn commit_view<C: Catalog, A: Authorizer + Clone, S: SecretStor
     parameters: ViewParameters,
     request: CommitViewRequest,
     state: ApiContext<State<A, C, S>>,
-    data_access: DataAccess,
+    data_access: impl Into<DataAccessMode>,
     request_metadata: RequestMetadata,
 ) -> Result<LoadViewResult> {
+    let data_access = data_access.into();
     // ------------------- VALIDATIONS -------------------
     let warehouse_id = require_warehouse_id(parameters.prefix.clone())?;
 
@@ -69,7 +70,12 @@ pub(crate) async fn commit_view<C: Catalog, A: Authorizer + Clone, S: SecretStor
     let mut t = C::Transaction::begin_read(state.v1_state.catalog.clone()).await?;
     let view_id = C::view_to_id(warehouse_id, &identifier, t.transaction()).await; // We can't fail before AuthZ;
     let view_id = authorizer
-        .require_view_action(&request_metadata, view_id, CatalogViewAction::CanCommit)
+        .require_view_action(
+            &request_metadata,
+            warehouse_id,
+            view_id,
+            CatalogViewAction::CanCommit,
+        )
         .await?;
 
     // ------------------- BUSINESS LOGIC -------------------
@@ -99,6 +105,7 @@ pub(crate) async fn commit_view<C: Catalog, A: Authorizer + Clone, S: SecretStor
     loop {
         let result = try_commit_view::<C, A, S>(
             CommitViewContext {
+                warehouse_id,
                 namespace_id,
                 view_id,
                 identifier: &identifier,
@@ -109,7 +116,6 @@ pub(crate) async fn commit_view<C: Catalog, A: Authorizer + Clone, S: SecretStor
             },
             &state,
             &request_metadata,
-            warehouse_id,
         )
         .await;
 
@@ -153,13 +159,14 @@ pub(crate) async fn commit_view<C: Catalog, A: Authorizer + Clone, S: SecretStor
 
 // Context structure to hold static parameters for retry function
 struct CommitViewContext<'a> {
+    warehouse_id: WarehouseId,
     namespace_id: NamespaceId,
     view_id: ViewId,
     identifier: &'a TableIdent,
     storage_profile: &'a StorageProfile,
     storage_secret_id: Option<SecretIdent>,
     request: &'a CommitViewRequest,
-    data_access: DataAccess,
+    data_access: DataAccessMode,
 }
 
 // Core commit logic that may be retried
@@ -167,7 +174,6 @@ async fn try_commit_view<C: Catalog, A: Authorizer + Clone, S: SecretStore>(
     ctx: CommitViewContext<'_>,
     state: &ApiContext<State<A, C, S>>,
     request_metadata: &RequestMetadata,
-    warehouse_id: WarehouseId,
 ) -> Result<(LoadViewResult, crate::service::endpoint_hooks::ViewCommit)> {
     let mut t = C::Transaction::begin_write(state.v1_state.catalog.clone()).await?;
 
@@ -175,7 +181,7 @@ async fn try_commit_view<C: Catalog, A: Authorizer + Clone, S: SecretStore>(
     let ViewMetadataWithLocation {
         metadata_location: previous_metadata_location,
         metadata: before_update_metadata,
-    } = C::load_view(ctx.view_id, false, t.transaction()).await?;
+    } = C::load_view(ctx.warehouse_id, ctx.view_id, false, t.transaction()).await?;
     let previous_view_location = parse_view_location(before_update_metadata.location())?;
     let previous_metadata_location = parse_view_location(&previous_metadata_location)?;
 
@@ -207,6 +213,7 @@ async fn try_commit_view<C: Catalog, A: Authorizer + Clone, S: SecretStore>(
 
     C::update_view_metadata(
         ViewCommit {
+            warehouse_id: ctx.warehouse_id,
             namespace_id: ctx.namespace_id,
             view_id: ctx.view_id,
             view_ident: ctx.identifier,
@@ -254,7 +261,7 @@ async fn try_commit_view<C: Catalog, A: Authorizer + Clone, S: SecretStore>(
             &metadata_location,
             StoragePermissions::ReadWriteDelete,
             request_metadata,
-            warehouse_id,
+            ctx.warehouse_id,
             ctx.view_id.into(),
         )
         .await?;
@@ -290,8 +297,8 @@ fn check_asserts(requirements: Option<&Vec<ViewRequirement>>, view_id: ViewId) -
     if let Some(requirements) = requirements {
         for assertion in requirements {
             match assertion {
-                ViewRequirement::AssertViewUuid(uuid) => {
-                    if uuid.uuid != *view_id {
+                ViewRequirement::AssertViewUuid(req) => {
+                    if req.uuid != *view_id {
                         return Err(ErrorModel::bad_request(
                             "View UUID does not match",
                             "ViewUuidMismatch",
@@ -397,6 +404,7 @@ mod test {
             create::test::{create_view, create_view_request},
             test::setup,
         },
+        WarehouseId,
     };
 
     #[sqlx::test]
@@ -413,7 +421,7 @@ mod test {
         .await
         .unwrap();
 
-        let rq: CommitViewRequest = spark_commit_update_request(Some(view.metadata.uuid()));
+        let rq: CommitViewRequest = spark_commit_update_request(whi, Some(view.metadata.uuid()));
 
         let res = Box::pin(super::commit_view(
             views::ViewParameters {
@@ -466,7 +474,7 @@ mod test {
         .await
         .unwrap();
 
-        let rq: CommitViewRequest = spark_commit_update_request(Some(Uuid::now_v7()));
+        let rq: CommitViewRequest = spark_commit_update_request(whi, Some(Uuid::now_v7()));
 
         let err = Box::pin(super::commit_view(
             ViewParameters {
@@ -490,7 +498,10 @@ mod test {
         assert_eq!(err.error.r#type, "ViewUuidMismatch");
     }
 
-    fn spark_commit_update_request(asserted_uuid: Option<Uuid>) -> CommitViewRequest {
+    fn spark_commit_update_request(
+        warehouse_id: WarehouseId,
+        asserted_uuid: Option<Uuid>,
+    ) -> CommitViewRequest {
         let uuid = asserted_uuid.map_or("019059cb-9277-7ff0-b71a-537df05b33f8".into(), |u| {
             u.to_string()
         });
@@ -498,6 +509,7 @@ mod test {
   "requirements": [
     {
       "type": "assert-view-uuid",
+      "warehouse-uuid": *warehouse_id,
       "uuid": &uuid
     }
   ],

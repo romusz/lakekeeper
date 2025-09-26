@@ -31,7 +31,6 @@ use super::{
         ViewRelation as AllViewRelations, WarehouseAssignment,
         WarehouseRelation as AllWarehouseRelation,
     },
-    OPENFGA_SERVER,
 };
 use crate::{
     api::ApiContext,
@@ -366,10 +365,11 @@ async fn get_server_access<C: Catalog, S: SecretStore>(
 ) -> Result<(StatusCode, Json<GetServerAccessResponse>)> {
     let authorizer = api_context.v1_state.authz;
     let query = ParsedAccessQuery::try_from(query)?;
+    let openfga_server = authorizer.openfga_server().to_string();
     let relations = get_allowed_actions(
         authorizer,
         metadata.actor(),
-        &OPENFGA_SERVER,
+        &openfga_server,
         query.principal.as_ref(),
     )
     .await?;
@@ -676,9 +676,10 @@ async fn get_namespace_access_by_id<C: Catalog, S: SecretStore>(
 #[utoipa::path(
     get,
     tag = "permissions",
-    path = "/management/v1/permissions/table/{table_id}/access",
+    path = "/management/v1/permissions/warehouse/{warehouse_id}/table/{table_id}/access",
     params(
         GetAccessQuery,
+        ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
         ("table_id" = Uuid, Path, description = "Table ID")
     ),
     responses(
@@ -686,7 +687,7 @@ async fn get_namespace_access_by_id<C: Catalog, S: SecretStore>(
     )
 )]
 async fn get_table_access_by_id<C: Catalog, S: SecretStore>(
-    Path(table_id): Path<TableId>,
+    Path((warehouse_id, table_id)): Path<(WarehouseId, TableId)>,
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
     Extension(metadata): Extension<RequestMetadata>,
     Query(query): Query<GetAccessQuery>,
@@ -696,7 +697,7 @@ async fn get_table_access_by_id<C: Catalog, S: SecretStore>(
     let relations = get_allowed_actions(
         authorizer,
         metadata.actor(),
-        &table_id.to_openfga(),
+        &(warehouse_id, table_id).to_openfga(),
         query.principal.as_ref(),
     )
     .await?;
@@ -713,17 +714,18 @@ async fn get_table_access_by_id<C: Catalog, S: SecretStore>(
 #[utoipa::path(
     get,
     tag = "permissions",
-    path = "/management/v1/permissions/view/{view_id}/access",
+    path = "/management/v1/permissions/warehouse/{warehouse_id}/view/{view_id}/access",
     params(
         GetAccessQuery,
-        ("view_id" = Uuid, Path, description = "View ID")
+        ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
+        ("view_id" = Uuid, Path, description = "View ID"),
     ),
     responses(
             (status = 200, body = GetViewAccessResponse),
     )
 )]
 async fn get_view_access_by_id<C: Catalog, S: SecretStore>(
-    Path(view_id): Path<ViewId>,
+    Path((warehouse_id, view_id)): Path<(WarehouseId, ViewId)>,
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
     Extension(metadata): Extension<RequestMetadata>,
     Query(query): Query<GetAccessQuery>,
@@ -733,7 +735,7 @@ async fn get_view_access_by_id<C: Catalog, S: SecretStore>(
     let relations = get_allowed_actions(
         authorizer,
         metadata.actor(),
-        &view_id.to_openfga(),
+        &(warehouse_id, view_id).to_openfga(),
         query.principal.as_ref(),
     )
     .await?;
@@ -797,14 +799,11 @@ async fn get_server_assignments<C: Catalog, S: SecretStore>(
     Query(query): Query<GetServerAssignmentsQuery>,
 ) -> Result<(StatusCode, Json<GetServerAssignmentsResponse>)> {
     let authorizer = api_context.v1_state.authz;
+    let server_id = authorizer.openfga_server().to_string();
     authorizer
-        .require_action(
-            &metadata,
-            AllServerAction::CanReadAssignments,
-            &OPENFGA_SERVER,
-        )
+        .require_action(&metadata, AllServerAction::CanReadAssignments, &server_id)
         .await?;
-    let assignments = get_relations(authorizer, query.relations, &OPENFGA_SERVER).await?;
+    let assignments = get_relations(authorizer, query.relations, &server_id).await?;
 
     Ok((
         StatusCode::OK,
@@ -959,9 +958,10 @@ async fn get_namespace_assignments_by_id<C: Catalog, S: SecretStore>(
 #[utoipa::path(
     get,
     tag = "permissions",
-    path = "/management/v1/permissions/table/{table_id}/assignments",
+    path = "/management/v1/permissions/warehouse/{warehouse_id}/table/{table_id}/assignments",
     params(
         GetTableAssignmentsQuery,
+        ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
         ("table_id" = Uuid, Path, description = "Table ID"),
     ),
     responses(
@@ -969,13 +969,13 @@ async fn get_namespace_assignments_by_id<C: Catalog, S: SecretStore>(
     )
 )]
 async fn get_table_assignments_by_id<C: Catalog, S: SecretStore>(
-    Path(table_id): Path<TableId>,
+    Path((warehouse_id, table_id)): Path<(WarehouseId, TableId)>,
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
     Extension(metadata): Extension<RequestMetadata>,
     Query(query): Query<GetTableAssignmentsQuery>,
 ) -> Result<(StatusCode, Json<GetTableAssignmentsResponse>)> {
     let authorizer = api_context.v1_state.authz;
-    let object = table_id.to_openfga();
+    let object = (warehouse_id, table_id).to_openfga();
     authorizer
         .require_action(&metadata, AllTableRelations::CanReadAssignments, &object)
         .await?;
@@ -991,9 +991,10 @@ async fn get_table_assignments_by_id<C: Catalog, S: SecretStore>(
 #[utoipa::path(
     get,
     tag = "permissions",
-    path = "/management/v1/permissions/view/{view_id}/assignments",
+    path = "/management/v1/permissions/warehouse/{warehouse_id}/view/{view_id}/assignments",
     params(
         GetViewAssignmentsQuery,
+        ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
         ("view_id" = Uuid, Path, description = "View ID"),
     ),
     responses(
@@ -1001,13 +1002,13 @@ async fn get_table_assignments_by_id<C: Catalog, S: SecretStore>(
     )
 )]
 async fn get_view_assignments_by_id<C: Catalog, S: SecretStore>(
-    Path(view_id): Path<ViewId>,
+    Path((warehouse_id, view_id)): Path<(WarehouseId, ViewId)>,
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
     Extension(metadata): Extension<RequestMetadata>,
     Query(query): Query<GetViewAssignmentsQuery>,
 ) -> Result<(StatusCode, Json<GetViewAssignmentsResponse>)> {
     let authorizer = api_context.v1_state.authz;
-    let object = view_id.to_openfga();
+    let object = (warehouse_id, view_id).to_openfga();
     authorizer
         .require_action(&metadata, AllViewRelations::CanReadAssignments, &object)
         .await?;
@@ -1035,12 +1036,13 @@ async fn update_server_assignments<C: Catalog, S: SecretStore>(
     Json(request): Json<UpdateServerAssignmentsRequest>,
 ) -> Result<StatusCode> {
     let authorizer = api_context.v1_state.authz;
+    let server_id = authorizer.openfga_server().to_string();
     checked_write(
         authorizer,
         metadata.actor(),
         request.writes,
         request.deletes,
-        &OPENFGA_SERVER,
+        &server_id,
     )
     .await?;
 
@@ -1178,9 +1180,10 @@ async fn update_namespace_assignments_by_id<C: Catalog, S: SecretStore>(
 #[utoipa::path(
     post,
     tag = "permissions",
-    path = "/management/v1/permissions/table/{table_id}/assignments",
+    path = "/management/v1/permissions/warehouse/{warehouse_id}/table/{table_id}/assignments",
     request_body = UpdateTableAssignmentsRequest,
     params(
+        ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
         ("table_id" = Uuid, Path, description = "Table ID"),
     ),
     responses(
@@ -1188,7 +1191,7 @@ async fn update_namespace_assignments_by_id<C: Catalog, S: SecretStore>(
     )
 )]
 async fn update_table_assignments_by_id<C: Catalog, S: SecretStore>(
-    Path(table_id): Path<TableId>,
+    Path((warehouse_id, table_id)): Path<(WarehouseId, TableId)>,
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
     Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<UpdateTableAssignmentsRequest>,
@@ -1199,7 +1202,7 @@ async fn update_table_assignments_by_id<C: Catalog, S: SecretStore>(
         metadata.actor(),
         request.writes,
         request.deletes,
-        &table_id.to_openfga(),
+        &(warehouse_id, table_id).to_openfga(),
     )
     .await?;
 
@@ -1210,9 +1213,10 @@ async fn update_table_assignments_by_id<C: Catalog, S: SecretStore>(
 #[utoipa::path(
     post,
     tag = "permissions",
-    path = "/management/v1/permissions/view/{view_id}/assignments",
+    path = "/management/v1/permissions/warehouse/{warehouse_id}/view/{view_id}/assignments",
     request_body = UpdateViewAssignmentsRequest,
     params(
+        ("warehouse_id" = Uuid, Path, description = "Warehouse ID"),
         ("view_id" = Uuid, Path, description = "View ID"),
     ),
     responses(
@@ -1220,7 +1224,7 @@ async fn update_table_assignments_by_id<C: Catalog, S: SecretStore>(
     )
 )]
 async fn update_view_assignments_by_id<C: Catalog, S: SecretStore>(
-    Path(view_id): Path<ViewId>,
+    Path((warehouse_id, view_id)): Path<(WarehouseId, ViewId)>,
     AxumState(api_context): AxumState<ApiContext<State<OpenFGAAuthorizer, C, S>>>,
     Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<UpdateViewAssignmentsRequest>,
@@ -1231,14 +1235,14 @@ async fn update_view_assignments_by_id<C: Catalog, S: SecretStore>(
         metadata.actor(),
         request.writes,
         request.deletes,
-        &view_id.to_openfga(),
+        &(warehouse_id, view_id).to_openfga(),
     )
     .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Update permissions for a role
+// Update permissions for a role
 #[utoipa::path(
     post,
     tag = "permissions",
@@ -1375,11 +1379,11 @@ pub(super) fn new_v1_router<C: Catalog, S: SecretStore>(
             post(set_namespace_managed_access),
         )
         .route(
-            "/permissions/table/{table_id}/access",
+            "/permissions/warehouse/{warehouse_id}/table/{table_id}/access",
             get(get_table_access_by_id),
         )
         .route(
-            "/permissions/view/{table_id}/access",
+            "/permissions/warehouse/{warehouse_id}/view/{view_id}/access",
             get(get_view_access_by_id),
         )
         .route(
@@ -1407,11 +1411,11 @@ pub(super) fn new_v1_router<C: Catalog, S: SecretStore>(
             get(get_namespace_assignments_by_id).post(update_namespace_assignments_by_id),
         )
         .route(
-            "/permissions/table/{table_id}/assignments",
+            "/permissions/warehouse/{warehouse_id}/table/{table_id}/assignments",
             get(get_table_assignments_by_id).post(update_table_assignments_by_id),
         )
         .route(
-            "/permissions/view/{view_id}/assignments",
+            "/permissions/warehouse/{warehouse_id}/view/{view_id}/assignments",
             get(get_view_assignments_by_id).post(update_view_assignments_by_id),
         )
         .route("/permissions/check", post(check))
@@ -1427,11 +1431,11 @@ async fn get_relations<RA: Assignment>(
     let relations = relations.iter().map(|relation| async {
         authorizer
             .clone()
-            .read_all(ReadRequestTupleKey {
+            .read_all(Some(ReadRequestTupleKey {
                 user: String::new(),
                 relation: relation.to_openfga().to_string(),
                 object: object.to_string(),
-            })
+            }))
             .await?
             .into_iter()
             .filter_map(|t| t.key)
@@ -1627,8 +1631,6 @@ async fn set_managed_access<T: OpenFgaEntity>(
 
 #[cfg(test)]
 mod tests {
-    use needs_env_var::needs_env_var;
-
     use super::*;
 
     #[test]
@@ -1640,8 +1642,7 @@ mod tests {
         );
     }
 
-    #[needs_env_var(TEST_OPENFGA = 1)]
-    mod openfga {
+    mod openfga_integration_tests {
         use openfga_client::client::TupleKey;
         use uuid::Uuid;
 
@@ -1689,9 +1690,9 @@ mod tests {
         #[tracing_test::traced_test]
         async fn test_get_relations() {
             let (_, authorizer) = authorizer_for_empty_store().await;
-
+            let openfga_server = authorizer.openfga_server();
             let relations: Vec<ServerAssignment> =
-                get_relations(authorizer.clone(), None, &OPENFGA_SERVER)
+                get_relations(authorizer.clone(), None, openfga_server)
                     .await
                     .unwrap();
             assert!(
@@ -1705,7 +1706,7 @@ mod tests {
                     Some(vec![TupleKey {
                         user: user_id.to_openfga(),
                         relation: ServerRelation::Admin.to_openfga().to_string(),
-                        object: OPENFGA_SERVER.to_string(),
+                        object: openfga_server.to_string(),
                         condition: None,
                     }]),
                     None,
@@ -1714,7 +1715,7 @@ mod tests {
                 .unwrap();
 
             let relations: Vec<ServerAssignment> =
-                get_relations(authorizer.clone(), None, &OPENFGA_SERVER)
+                get_relations(authorizer.clone(), None, openfga_server)
                     .await
                     .unwrap();
             assert_eq!(relations.len(), 1);
@@ -1764,11 +1765,14 @@ mod tests {
             let res = authorizer
                 .are_allowed_namespace_actions(
                     &RequestMetadata::random_human(user_id_assignee.clone()),
-                    namespace_ids.clone(),
-                    vec![CatalogNamespaceAction::CanDelete; namespace_ids.len()],
+                    namespace_ids
+                        .iter()
+                        .map(|id| (*id, CatalogNamespaceAction::CanDelete))
+                        .collect(),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_inner();
             assert_eq!(res, vec![false; namespace_ids.len()]);
 
             for grant_chunk in to_grant.chunks(write_chunk_size) {
@@ -1783,11 +1787,14 @@ mod tests {
             let res = authorizer
                 .are_allowed_namespace_actions(
                     &RequestMetadata::random_human(user_id_assignee.clone()),
-                    namespace_ids.clone(),
-                    vec![CatalogNamespaceAction::CanDelete; namespace_ids.len()],
+                    namespace_ids
+                        .iter()
+                        .map(|id| (*id, CatalogNamespaceAction::CanDelete))
+                        .collect(),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .into_inner();
             assert_eq!(res, permissions);
         }
 
@@ -1826,8 +1833,9 @@ mod tests {
             let (_, authorizer) = authorizer_for_empty_store().await;
             let user_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
             let actor = Actor::Principal(user_id.clone());
+            let openfga_server = authorizer.openfga_server();
             let access: Vec<ServerAction> =
-                get_allowed_actions(authorizer.clone(), &actor, &OPENFGA_SERVER, None)
+                get_allowed_actions(authorizer.clone(), &actor, openfga_server, None)
                     .await
                     .unwrap();
             assert!(access.is_empty());
@@ -1837,7 +1845,7 @@ mod tests {
                     Some(vec![TupleKey {
                         user: user_id.to_openfga(),
                         relation: ServerRelation::Admin.to_openfga().to_string(),
-                        object: OPENFGA_SERVER.to_string(),
+                        object: openfga_server.to_string(),
                         condition: None,
                     }]),
                     None,
@@ -1846,7 +1854,7 @@ mod tests {
                 .unwrap();
 
             let access: Vec<ServerAction> =
-                get_allowed_actions(authorizer.clone(), &actor, &OPENFGA_SERVER, None)
+                get_allowed_actions(authorizer.clone(), &actor, openfga_server, None)
                     .await
                     .unwrap();
             for action in ServerAction::iter() {
@@ -1857,6 +1865,7 @@ mod tests {
         #[tokio::test]
         async fn test_get_allowed_actions_as_role() {
             let (_, authorizer) = authorizer_for_empty_store().await;
+            let openfga_server = authorizer.openfga_server();
             let role_id = RoleId::new(Uuid::now_v7());
             let user_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
             let actor = Actor::Role {
@@ -1864,7 +1873,7 @@ mod tests {
                 assumed_role: role_id,
             };
             let access: Vec<ServerAction> =
-                get_allowed_actions(authorizer.clone(), &actor, &OPENFGA_SERVER, None)
+                get_allowed_actions(authorizer.clone(), &actor, openfga_server, None)
                     .await
                     .unwrap();
             assert!(access.is_empty());
@@ -1874,7 +1883,7 @@ mod tests {
                     Some(vec![TupleKey {
                         user: role_id.into_assignees().to_openfga(),
                         relation: ServerRelation::Admin.to_openfga().to_string(),
-                        object: OPENFGA_SERVER.to_string(),
+                        object: openfga_server.to_string(),
                         condition: None,
                     }]),
                     None,
@@ -1883,7 +1892,7 @@ mod tests {
                 .unwrap();
 
             let access: Vec<ServerAction> =
-                get_allowed_actions(authorizer.clone(), &actor, &OPENFGA_SERVER, None)
+                get_allowed_actions(authorizer.clone(), &actor, openfga_server, None)
                     .await
                     .unwrap();
             for action in ServerAction::iter() {
@@ -1894,6 +1903,7 @@ mod tests {
         #[tokio::test]
         async fn test_get_allowed_actions_for_other_principal() {
             let (_, authorizer) = authorizer_for_empty_store().await;
+            let openfga_server = authorizer.openfga_server();
             let user_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
             let role_id = RoleId::new(Uuid::now_v7());
             let actor = Actor::Principal(user_id.clone());
@@ -1903,7 +1913,7 @@ mod tests {
                     Some(vec![TupleKey {
                         user: user_id.to_openfga(),
                         relation: ServerRelation::Admin.to_openfga().to_string(),
-                        object: OPENFGA_SERVER.to_string(),
+                        object: openfga_server.to_string(),
                         condition: None,
                     }]),
                     None,
@@ -1914,7 +1924,7 @@ mod tests {
             let access: Vec<ServerAction> = get_allowed_actions(
                 authorizer.clone(),
                 &actor,
-                &OPENFGA_SERVER,
+                openfga_server,
                 Some(&role_id.into()),
             )
             .await
@@ -1926,7 +1936,7 @@ mod tests {
                     Some(vec![TupleKey {
                         user: role_id.into_assignees().to_openfga(),
                         relation: ServerRelation::Admin.to_openfga().to_string(),
-                        object: OPENFGA_SERVER.to_string(),
+                        object: openfga_server.to_string(),
                         condition: None,
                     }]),
                     None,
@@ -1937,7 +1947,7 @@ mod tests {
             let access: Vec<ServerAction> = get_allowed_actions(
                 authorizer.clone(),
                 &actor,
-                &OPENFGA_SERVER,
+                openfga_server,
                 Some(&role_id.into()),
             )
             .await
@@ -1954,12 +1964,14 @@ mod tests {
             let user1_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
             let user2_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
 
+            let openfga_server = authorizer.openfga_server();
+
             authorizer
                 .write(
                     Some(vec![TupleKey {
                         user: user1_id.to_openfga(),
                         relation: ServerRelation::Admin.to_openfga().to_string(),
-                        object: OPENFGA_SERVER.to_string(),
+                        object: openfga_server.to_string(),
                         condition: None,
                     }]),
                     None,
@@ -1972,13 +1984,13 @@ mod tests {
                 &Actor::Principal(user1_id.clone()),
                 vec![ServerAssignment::Admin(user2_id.into())],
                 vec![],
-                &OPENFGA_SERVER,
+                openfga_server,
             )
             .await
             .unwrap();
 
             let relations: Vec<ServerAssignment> =
-                get_relations(authorizer.clone(), None, &OPENFGA_SERVER)
+                get_relations(authorizer.clone(), None, openfga_server)
                     .await
                     .unwrap();
             assert_eq!(relations.len(), 2);
