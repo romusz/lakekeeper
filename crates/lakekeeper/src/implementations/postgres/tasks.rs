@@ -29,13 +29,15 @@ pub(crate) struct InsertResult {
 #[derive(Debug, sqlx::Type, Clone, Copy)]
 #[sqlx(type_name = "entity_type", rename_all = "kebab-case")]
 enum EntityType {
-    Tabular,
+    Table,
+    View,
 }
 
 impl From<EntityId> for EntityType {
     fn from(entity_id: EntityId) -> Self {
         match entity_id {
-            EntityId::Tabular(_) => Self::Tabular,
+            EntityId::Table(_) => Self::Table,
+            EntityId::View(_) => Self::View,
         }
     }
 }
@@ -73,7 +75,7 @@ pub(crate) async fn queue_task_batch(
         scheduled_fors.push(schedule_for);
         payloads.push(payload);
         entity_types.push(EntityType::from(entity_id));
-        entity_ids.push(entity_id.to_uuid());
+        entity_ids.push(entity_id.as_uuid());
         entity_names.push(serde_json::to_value(&entity_name).map_err(|e| {
             ErrorModel::internal(
                 format!("Failed to serialize entity name: {entity_name:?}, error: {e}"),
@@ -164,7 +166,8 @@ pub(crate) async fn queue_task_batch(
                 // queue_name: record.queue_name,
                 #[cfg(test)]
                 entity_id: match record.entity_type {
-                    EntityType::Tabular => EntityId::Tabular(record.entity_id),
+                    EntityType::View => EntityId::View(record.entity_id.into()),
+                    EntityType::Table => EntityId::Table(record.entity_id.into()),
                 },
             })
             .collect_vec()
@@ -293,7 +296,8 @@ pub(crate) async fn pick_task(
             task_metadata: TaskMetadata {
                 warehouse_id: task.warehouse_id.into(),
                 entity_id: match task.entity_type {
-                    EntityType::Tabular => EntityId::Tabular(task.entity_id),
+                    EntityType::View => EntityId::View(task.entity_id.into()),
+                    EntityType::Table => EntityId::Table(task.entity_id.into()),
                 },
                 entity_name: task.entity_name,
                 parent_task_id: task.parent_task_id.map(TaskId::from),
@@ -612,8 +616,12 @@ pub(crate) async fn record_failure(
     Ok(())
 }
 
-pub(crate) async fn get_task_queue_config(
-    transaction: &mut PgConnection,
+pub(crate) async fn get_task_queue_config<
+    'e,
+    'c: 'e,
+    E: sqlx::Executor<'c, Database = sqlx::Postgres>,
+>(
+    connection: E,
     warehouse_id: WarehouseId,
     queue_name: &TaskQueueName,
 ) -> crate::api::Result<Option<GetTaskQueueConfigResponse>> {
@@ -626,7 +634,7 @@ pub(crate) async fn get_task_queue_config(
         *warehouse_id,
         queue_name.as_str()
     )
-    .fetch_optional(transaction)
+    .fetch_optional(connection)
     .await
     .map_err(|e| {
         tracing::error!(?e, "Failed to get task queue config");
@@ -1031,7 +1039,7 @@ mod test {
                     warehouse_id,
                     parent_task_id,
                     entity_id,
-                    entity_name: vec![format!("entity-{}", entity_id.to_uuid())],
+                    entity_name: vec![format!("entity-{}", entity_id.as_uuid())],
                     schedule_for,
                 },
                 payload: payload.unwrap_or(serde_json::json!({})),
@@ -1051,7 +1059,7 @@ mod test {
         let mut conn = pool.acquire().await.unwrap();
         let warehouse_id = setup_warehouse(pool.clone()).await;
 
-        let entity_id = EntityId::Tabular(Uuid::now_v7());
+        let entity_id = EntityId::Table(Uuid::now_v7().into());
         let tq_name = generate_tq_name();
         let id = queue_task(
             &mut conn,
@@ -1082,7 +1090,7 @@ mod test {
             &mut conn,
             &tq_name,
             None,
-            EntityId::Tabular(Uuid::now_v7()),
+            EntityId::Table(Uuid::now_v7().into()),
             warehouse_id,
             None,
             None,
@@ -1132,7 +1140,7 @@ mod test {
             &mut conn,
             &tq_name,
             None,
-            EntityId::Tabular(Uuid::now_v7()),
+            EntityId::Table(Uuid::now_v7().into()),
             warehouse_id,
             None,
             None,
@@ -1190,7 +1198,7 @@ mod test {
             &mut conn,
             &tq_name,
             None,
-            EntityId::Tabular(Uuid::now_v7()),
+            EntityId::Table(Uuid::now_v7().into()),
             warehouse_id,
             None,
             None,
@@ -1229,7 +1237,7 @@ mod test {
         let tq_name = generate_tq_name();
 
         let warehouse_id = setup_warehouse(pool.clone()).await;
-        let entity = EntityId::Tabular(Uuid::now_v7());
+        let entity = EntityId::Table(Uuid::now_v7().into());
 
         let id = queue_task(
             &mut conn,
@@ -1292,7 +1300,7 @@ mod test {
     async fn test_cancelled_tasks_can_be_reinserted(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
         let warehouse_id = setup_warehouse(pool.clone()).await;
-        let entity = EntityId::Tabular(Uuid::now_v7());
+        let entity = EntityId::Table(Uuid::now_v7().into());
         let tq_name = generate_tq_name();
 
         let id = queue_task(
@@ -1351,7 +1359,7 @@ mod test {
         let tq_name = generate_tq_name();
 
         let warehouse_id = setup_warehouse(pool.clone()).await;
-        let entity = EntityId::Tabular(Uuid::now_v7());
+        let entity = EntityId::Table(Uuid::now_v7().into());
 
         let id = queue_task(
             &mut conn,
@@ -1420,7 +1428,7 @@ mod test {
             &mut conn,
             &tq_name,
             None,
-            EntityId::Tabular(Uuid::now_v7()),
+            EntityId::Table(Uuid::now_v7().into()),
             warehouse_id,
             Some(scheduled_for),
             None,
@@ -1460,7 +1468,7 @@ mod test {
             &mut conn,
             &tq_name,
             None,
-            EntityId::Tabular(Uuid::now_v7()),
+            EntityId::Table(Uuid::now_v7().into()),
             warehouse_id,
             None,
             None,
@@ -1505,7 +1513,7 @@ mod test {
             &mut conn,
             &tq_name,
             None,
-            EntityId::Tabular(Uuid::now_v7()),
+            EntityId::Table(Uuid::now_v7().into()),
             warehouse_id,
             None,
             None,
@@ -1523,7 +1531,7 @@ mod test {
             &mut conn,
             &tq_name,
             None,
-            EntityId::Tabular(Uuid::now_v7()),
+            EntityId::Table(Uuid::now_v7().into()),
             warehouse_id,
             None,
             None,
@@ -1579,7 +1587,7 @@ mod test {
             vec![
                 TaskInput {
                     task_metadata: TaskMetadata {
-                        entity_id: EntityId::Tabular(Uuid::now_v7()),
+                        entity_id: EntityId::Table(Uuid::now_v7().into()),
                         entity_name: task_1_entity_name.clone(),
                         warehouse_id,
                         parent_task_id: None,
@@ -1590,7 +1598,7 @@ mod test {
                 },
                 TaskInput {
                     task_metadata: TaskMetadata {
-                        entity_id: EntityId::Tabular(Uuid::now_v7()),
+                        entity_id: EntityId::Table(Uuid::now_v7().into()),
                         entity_name: task_2_entity_name.clone(),
                         warehouse_id,
                         parent_task_id: None,
@@ -1648,7 +1656,7 @@ mod test {
     fn task_metadata(warehouse_id: WarehouseId, entity_id: EntityId) -> TaskMetadata {
         TaskMetadata {
             entity_id,
-            entity_name: vec![format!("entity-{}", entity_id.to_uuid())],
+            entity_name: vec![format!("entity-{}", entity_id.as_uuid())],
             warehouse_id,
             parent_task_id: None,
             schedule_for: None,
@@ -1659,8 +1667,8 @@ mod test {
     async fn test_queue_batch_idempotency(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
         let warehouse_id = setup_warehouse(pool.clone()).await;
-        let idp1 = EntityId::Tabular(Uuid::now_v7());
-        let idp2 = EntityId::Tabular(Uuid::now_v7());
+        let idp1 = EntityId::Table(Uuid::now_v7().into());
+        let idp2 = EntityId::Table(Uuid::now_v7().into());
         let tq_name = generate_tq_name();
         let _ids = queue_task_batch(
             &mut conn,
@@ -1710,7 +1718,7 @@ mod test {
         // Re-insert the first task with the same idempotency key
         // and a new idempotency key
         // This should create a new task with the new idempotency key
-        let new_key = EntityId::Tabular(Uuid::now_v7());
+        let new_key = EntityId::Table(Uuid::now_v7().into());
         let ids_second = queue_task_batch(
             &mut conn,
             &tq_name,
@@ -1773,7 +1781,7 @@ mod test {
         let warehouse_id = setup_warehouse(pool.clone()).await;
         let tq_name = generate_tq_name();
 
-        assert!(get_task_queue_config(&mut conn, warehouse_id, &tq_name)
+        assert!(get_task_queue_config(&mut *conn, warehouse_id, &tq_name)
             .await
             .unwrap()
             .is_none());
@@ -1787,7 +1795,7 @@ mod test {
             .await
             .unwrap();
 
-        let response = get_task_queue_config(&mut conn, warehouse_id, &tq_name)
+        let response = get_task_queue_config(&mut *conn, warehouse_id, &tq_name)
             .await
             .unwrap()
             .unwrap();
@@ -1819,7 +1827,7 @@ mod test {
             &mut conn,
             &tq_name,
             None,
-            EntityId::Tabular(Uuid::now_v7()),
+            EntityId::Table(Uuid::now_v7().into()),
             warehouse_id,
             None,
             Some(payload.clone()),
@@ -1843,7 +1851,7 @@ mod test {
             &mut conn,
             &other_tq_name,
             None,
-            EntityId::Tabular(Uuid::now_v7()),
+            EntityId::Table(Uuid::now_v7().into()),
             warehouse_id,
             None,
             Some(other_payload.clone()),
@@ -1866,7 +1874,7 @@ mod test {
         let mut conn = pool.acquire().await.unwrap();
         let warehouse_id = setup_warehouse(pool.clone()).await;
         let tq_name = generate_tq_name();
-        let entity_id = EntityId::Tabular(Uuid::now_v7());
+        let entity_id = EntityId::Table(Uuid::now_v7().into());
 
         // Queue and pick up a task
         let task_id = queue_task(
@@ -1929,7 +1937,7 @@ mod test {
         let mut conn = pool.acquire().await.unwrap();
         let warehouse_id = setup_warehouse(pool.clone()).await;
         let tq_name = generate_tq_name();
-        let entity_id = EntityId::Tabular(Uuid::now_v7());
+        let entity_id = EntityId::Table(Uuid::now_v7().into());
 
         // Queue and pick up a task
         let task_id = queue_task(
@@ -2005,7 +2013,7 @@ mod test {
         let mut conn = pool.acquire().await.unwrap();
         let warehouse_id = setup_warehouse(pool.clone()).await;
         let tq_name = generate_tq_name();
-        let entity_id = EntityId::Tabular(Uuid::now_v7());
+        let entity_id = EntityId::Table(Uuid::now_v7().into());
 
         // Queue and pick up a task
         let task_id = queue_task(
@@ -2048,7 +2056,7 @@ mod test {
         let mut conn = pool.acquire().await.unwrap();
         let warehouse_id = setup_warehouse(pool.clone()).await;
         let tq_name = generate_tq_name();
-        let entity_id = EntityId::Tabular(Uuid::now_v7());
+        let entity_id = EntityId::Table(Uuid::now_v7().into());
 
         // Queue and pick up a task
         let task_id = queue_task(
@@ -2113,7 +2121,7 @@ mod test {
         let mut conn = pool.acquire().await.unwrap();
         let warehouse_id = setup_warehouse(pool.clone()).await;
         let tq_name = generate_tq_name();
-        let entity_id = EntityId::Tabular(Uuid::now_v7());
+        let entity_id = EntityId::Table(Uuid::now_v7().into());
 
         // Queue and pick up a task
         let task_id = queue_task(
@@ -2223,7 +2231,7 @@ mod test {
         let mut conn = pool.acquire().await.unwrap();
         let warehouse_id = setup_warehouse(pool.clone()).await;
         let tq_name = generate_tq_name();
-        let entity_id = EntityId::Tabular(Uuid::now_v7());
+        let entity_id = EntityId::Table(Uuid::now_v7().into());
 
         // Queue a task but don't pick it up (leave it scheduled)
         let task_id = queue_task(
@@ -2310,7 +2318,7 @@ mod test {
         let mut conn = pool.acquire().await.unwrap();
         let warehouse_id = setup_warehouse(pool.clone()).await;
         let tq_name = generate_tq_name();
-        let entity_id = EntityId::Tabular(Uuid::now_v7());
+        let entity_id = EntityId::Table(Uuid::now_v7().into());
 
         // Queue and pick up a task (make it running)
         let task_id = queue_task(
@@ -2387,7 +2395,7 @@ mod test {
         let mut conn = pool.acquire().await.unwrap();
         let warehouse_id = setup_warehouse(pool.clone()).await;
         let tq_name = generate_tq_name();
-        let entity_id = EntityId::Tabular(Uuid::now_v7());
+        let entity_id = EntityId::Table(Uuid::now_v7().into());
 
         // Queue and pick up a task
         let task_id = queue_task(
@@ -2464,7 +2472,7 @@ mod test {
         let tq_name = generate_tq_name();
 
         // Test 1: run_tasks_at with None (should run immediately)
-        let entity_id1 = EntityId::Tabular(Uuid::now_v7());
+        let entity_id1 = EntityId::Table(Uuid::now_v7().into());
         let future_time = Utc::now() + chrono::Duration::hours(2);
 
         let task_id1 = queue_task(
@@ -2499,7 +2507,7 @@ mod test {
         assert_eq!(task_after.task_id(), task_id1);
 
         // Test 2: run_tasks_at with specific time
-        let entity_id2 = EntityId::Tabular(Uuid::now_v7());
+        let entity_id2 = EntityId::Table(Uuid::now_v7().into());
         let specific_time = Utc::now() + chrono::Duration::minutes(30);
 
         let task_id2 = queue_task(
@@ -2568,7 +2576,7 @@ mod test {
         let mut conn = pool.acquire().await.unwrap();
         let warehouse_id = setup_warehouse(pool.clone()).await;
         let tq_name = generate_tq_name();
-        let entity_id = EntityId::Tabular(Uuid::now_v7());
+        let entity_id = EntityId::Table(Uuid::now_v7().into());
 
         // Step 1: Queue a new task
         let task_id = queue_task(

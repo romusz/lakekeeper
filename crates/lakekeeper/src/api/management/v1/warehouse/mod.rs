@@ -32,7 +32,7 @@ use crate::{
         authz::{Authorizer, CatalogProjectAction, CatalogWarehouseAction},
         secrets::SecretStore,
         task_queue::{tabular_expiration_queue::TabularExpirationTask, TaskFilter, TaskQueueName},
-        Catalog, ListFlags, NamespaceId, State, TableId, TabularId, Transaction, ViewId,
+        Catalog, ListFlags, NamespaceId, State, TabularId, Transaction,
     },
     ProjectId, WarehouseId,
 };
@@ -812,14 +812,10 @@ pub trait Service<C: Catalog, A: Authorizer, S: SecretStore> {
         // ------------------- Business Logic -------------------
         let catalog = context.v1_state.catalog;
         let mut transaction = C::Transaction::begin_write(catalog.clone()).await?;
-        let tabs = request
-            .targets
-            .clone()
-            .into_iter()
-            .map(|i| TableId::from(*i))
-            .collect::<Vec<_>>();
+        let tabular_ids = &request.targets;
         let undrop_tabular_responses =
-            C::clear_tabular_deleted_at(&tabs, warehouse_id, transaction.transaction()).await?;
+            C::clear_tabular_deleted_at(tabular_ids, warehouse_id, transaction.transaction())
+                .await?;
         TabularExpirationTask::cancel_scheduled_tasks::<C>(
             TaskFilter::TaskIds(
                 undrop_tabular_responses
@@ -909,13 +905,13 @@ pub trait Service<C: Catalog, A: Authorizer, S: SecretStore> {
                             TabularId::View(id) => authorizer.is_allowed_view_action(
                                 &request_metadata,
                                 warehouse_id,
-                                ViewId::from(*id),
+                                *id,
                                 crate::service::authz::CatalogViewAction::CanIncludeInList,
                             ),
                             TabularId::Table(id) => authorizer.is_allowed_table_action(
                                 &request_metadata,
                                 warehouse_id,
-                                TableId::from(*id),
+                                *id,
                                 crate::service::authz::CatalogTableAction::CanIncludeInList,
                             ),
                         }))
@@ -1044,15 +1040,15 @@ pub trait Service<C: Catalog, A: Authorizer, S: SecretStore> {
             .await?;
 
         // ------------------- Business Logic -------------------
-        let mut transaction = C::Transaction::begin_read(context.v1_state.catalog).await?;
-        let config = C::get_task_queue_config(warehouse_id, queue_name, transaction.transaction())
+        let config = C::get_task_queue_config(warehouse_id, queue_name, context.v1_state.catalog)
             .await?
-            .ok_or(ErrorModel::not_found(
-                "Task queue config not found",
-                "TaskQueueConfigNotFound",
-                None,
-            ))?;
-        transaction.commit().await?;
+            .unwrap_or_else(|| GetTaskQueueConfigResponse {
+                queue_config: QueueConfigResponse {
+                    config: serde_json::json!({}),
+                    queue_name: queue_name.clone(),
+                },
+                max_seconds_since_last_heartbeat: None,
+            });
         Ok(config)
     }
 }
@@ -1105,7 +1101,7 @@ impl axum::response::IntoResponse for GetWarehouseResponse {
 impl From<crate::service::GetWarehouseResponse> for GetWarehouseResponse {
     fn from(warehouse: crate::service::GetWarehouseResponse) -> Self {
         Self {
-            id: warehouse.id.to_uuid(),
+            id: warehouse.id.into(),
             name: warehouse.name,
             project_id: warehouse.project_id,
             storage_profile: warehouse.storage_profile,

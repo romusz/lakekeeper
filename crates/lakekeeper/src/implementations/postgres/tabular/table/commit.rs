@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 
-use iceberg::{spec::TableMetadata, ErrorKind};
+use iceberg::{
+    spec::{TableMetadata, TableMetadataRef},
+    ErrorKind,
+};
 use iceberg_ext::catalog::rest::ErrorModel;
 use itertools::Itertools;
 use lakekeeper_io::Location;
@@ -99,7 +102,7 @@ pub(crate) async fn commit_table_transaction(
 struct TableMetadataTransition {
     warehouse_id: WarehouseId,
     previous_metadata_location: Option<Location>,
-    new_metadata: TableMetadata,
+    new_metadata: TableMetadataRef,
     new_metadata_location: Location,
 }
 
@@ -164,7 +167,7 @@ fn build_table_and_tabular_update_queries(
         })?;
 
         query_builder_table.push("(");
-        query_builder_table.push_bind(warehouse_id.to_uuid());
+        query_builder_table.push_bind(*warehouse_id);
         query_builder_table.push(", ");
         query_builder_table.push_bind(new_metadata.uuid());
         query_builder_table.push(", ");
@@ -182,7 +185,7 @@ fn build_table_and_tabular_update_queries(
         query_builder_table.push(")");
 
         query_builder_tabular.push("(");
-        query_builder_tabular.push_bind(warehouse_id.to_uuid());
+        query_builder_tabular.push_bind(*warehouse_id);
         query_builder_tabular.push(", ");
         query_builder_tabular.push_bind(new_metadata.uuid());
         query_builder_tabular.push(", ");

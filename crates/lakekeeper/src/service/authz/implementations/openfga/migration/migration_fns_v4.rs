@@ -8,6 +8,7 @@ use openfga_client::client::{
     BasicOpenFgaClient, BasicOpenFgaServiceClient, ConsistencyPreference, ReadRequestTupleKey,
     TupleKey,
 };
+use serde::Serialize;
 use strum::IntoEnumIterator;
 use tokio::{sync::Semaphore, task::JoinSet};
 
@@ -307,7 +308,7 @@ async fn get_all_namespaces(
     Ok(namespaces)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumIter)]
 enum TabularType {
     Table,
     View,
@@ -494,7 +495,9 @@ mod openfga_integration_tests {
         service::{
             authz::{
                 implementations::openfga::{
-                    migration::{add_model_v3, add_model_v4, V3_MODEL_VERSION, V4_MODEL_VERSION},
+                    migration::{
+                        add_model_v3, add_model_v4_0, V3_MODEL_VERSION, V4_0_MODEL_VERSION,
+                    },
                     new_client_from_config, OpenFGAAuthorizer, OpenFgaEntity, ServerRelation,
                     AUTH_CONFIG,
                 },
@@ -549,13 +552,11 @@ mod openfga_integration_tests {
 
     async fn new_v3_authorizer_for_empty_store() -> anyhow::Result<OpenFGAAuthorizer> {
         let (client, _, server_id) = v3_client_for_empty_store().await?;
-        // TODO(1361) server_id.to_openfga()
-        let openfga_server = format!("server:{server_id}");
         Ok(OpenFGAAuthorizer {
-            client,
+            client: client.clone(),
+            client_higher_consistency: client,
             health: Arc::new(RwLock::new(vec![])),
             server_id,
-            openfga_server,
         })
     }
 
@@ -572,7 +573,7 @@ mod openfga_integration_tests {
             &store_name,
             &AUTH_CONFIG.authorization_model_prefix,
         );
-        let mut model_manager = add_model_v4(model_manager);
+        let mut model_manager = add_model_v4_0(model_manager);
         let migration_state = MigrationState {
             store_name: store_name.clone(),
             server_id,
@@ -582,7 +583,7 @@ mod openfga_integration_tests {
         // Construct a new client to interact with v4.
         let store_id = client.store_id();
         let auth_model_id_v4 = model_manager
-            .get_authorization_model_id(*V4_MODEL_VERSION)
+            .get_authorization_model_id(*V4_0_MODEL_VERSION)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Auth model should be set after migration"))?;
         let client_v4 = BasicOpenFgaClient::new(client.client(), store_id, &auth_model_id_v4)
@@ -593,13 +594,11 @@ mod openfga_integration_tests {
     async fn new_v4_authorizer_for_empty_store() -> anyhow::Result<OpenFGAAuthorizer> {
         let (client, store_name, server_id) = v3_client_for_empty_store().await?;
         let client_v4 = migrate_to_v4(client, store_name, server_id).await?;
-        // TODO(1361) server_id.to_openfga()
-        let openfga_server = format!("server:{server_id}");
         Ok(OpenFGAAuthorizer {
-            client: client_v4,
+            client: client_v4.clone(),
+            client_higher_consistency: client_v4,
             health: Arc::new(RwLock::new(vec![])),
             server_id,
-            openfga_server,
         })
     }
 
@@ -1147,8 +1146,7 @@ mod openfga_integration_tests {
     #[allow(clippy::too_many_lines)]
     async fn test_v4_push_down_warehouse_id() -> anyhow::Result<()> {
         let (client, store_name, server_id) = v3_client_for_empty_store().await?;
-        // TODO(1361) server_id.to_openfga()
-        let openfga_server = format!("server:{server_id}");
+        let openfga_server = server_id.to_openfga();
 
         // Create the initial tuple structure:
         //
@@ -1462,13 +1460,11 @@ mod openfga_integration_tests {
         const NUM_TABULARS: usize = 10_000;
 
         let (client, store_name, server_id) = v3_client_for_empty_store().await?;
-        // TODO(1361) server_id.to_openfga()
-        let openfga_server = format!("server:{server_id}");
         let authorizer = OpenFGAAuthorizer {
             client: client.clone(),
+            client_higher_consistency: client.clone(),
             health: Arc::default(),
             server_id,
-            openfga_server: openfga_server.clone(),
         };
         let req_meta_human = RequestMetadata::random_human(UserId::new_unchecked("oidc", "user"));
 
@@ -1480,6 +1476,7 @@ mod openfga_integration_tests {
         // authorizer.
 
         // Write project tuples manually
+        let openfga_server = authorizer.openfga_server();
         let actor = req_meta_human.actor();
         let project_openfga = format!("project:{project_id}");
         authorizer

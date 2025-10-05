@@ -6,7 +6,7 @@ mod metrics;
 pub(crate) mod namespace;
 #[cfg(feature = "s3-signer")]
 mod s3_signer;
-pub(crate) mod tables;
+pub mod tables;
 pub(crate) mod tabular;
 pub(crate) mod views;
 
@@ -51,18 +51,20 @@ pub struct CatalogServer<C: Catalog, A: Authorizer + Clone, S: SecretStore> {
     secret_store: PhantomData<S>,
 }
 
-fn require_warehouse_id(prefix: Option<Prefix>) -> Result<WarehouseId> {
-    prefix
-        .ok_or_else(|| {
-            tracing::debug!("No prefix specified.");
-            ErrorModel::bad_request(
-                "No prefix specified. The warehouse-id must be provided as prefix in the URL."
-                    .to_string(),
-                "NoPrefixProvided",
-                None,
-            )
-        })?
-        .try_into()
+fn require_warehouse_id(prefix: Option<&Prefix>) -> std::result::Result<WarehouseId, ErrorModel> {
+    WarehouseId::from_str_or_bad_request(
+        prefix
+            .ok_or_else(|| {
+                tracing::debug!("No prefix specified.");
+                ErrorModel::bad_request(
+                    "No prefix specified. The warehouse-id must be provided as prefix in the URL."
+                        .to_string(),
+                    "NoPrefixProvided",
+                    None,
+                )
+            })?
+            .as_ref(),
+    )
 }
 
 pub(crate) async fn maybe_get_secret<S: SecretStore>(
@@ -237,7 +239,6 @@ where
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) mod test {
     use iceberg::NamespaceIdent;
     use iceberg_ext::catalog::rest::{CreateNamespaceRequest, CreateNamespaceResponse};
@@ -271,6 +272,7 @@ pub(crate) mod test {
         WarehouseId,
     };
 
+    #[allow(dead_code)]
     pub(crate) fn s3_compatible_profile() -> (StorageProfile, StorageCredential) {
         let key_prefix = format!("test_prefix-{}", Uuid::now_v7());
         let bucket = std::env::var("LAKEKEEPER_TEST__S3_BUCKET").unwrap();

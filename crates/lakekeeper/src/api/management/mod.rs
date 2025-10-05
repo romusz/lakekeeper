@@ -1,11 +1,14 @@
 #![allow(deprecated)]
 
 pub mod v1 {
+    #![allow(clippy::needless_for_each)]
+
     pub mod bootstrap;
     pub mod namespace;
     pub mod project;
     pub mod role;
     pub mod table;
+    pub mod tabular;
     pub mod tasks;
     pub mod user;
     pub mod view;
@@ -33,6 +36,7 @@ pub mod v1 {
     };
     use serde::{Deserialize, Serialize};
     use table::TableManagementService as _;
+    use tabular::TabularManagementService as _;
     use typed_builder::TypedBuilder;
     use user::{
         CreateUserRequest, SearchUserRequest, SearchUserResponse, Service as _, UpdateUserRequest,
@@ -40,7 +44,7 @@ pub mod v1 {
     };
     use utoipa::{
         openapi::{security::SecurityScheme, KnownFormat, RefOr},
-        OpenApi, ToSchema,
+        OpenApi, PartialSchema, ToSchema,
     };
     use view::ViewManagementService as _;
     use warehouse::{
@@ -57,6 +61,7 @@ pub mod v1 {
             iceberg::{types::PageToken, v1::PaginationQuery},
             management::v1::{
                 project::{EndpointStatisticsResponse, GetEndpointStatisticsRequest},
+                tabular::{SearchTabularRequest, SearchTabularResponse},
                 tasks::{
                     ControlTasksRequest, GetTaskDetailsQuery, GetTaskDetailsResponse,
                     ListTasksRequest, ListTasksResponse, Service,
@@ -133,6 +138,7 @@ pub mod v1 {
             rename_warehouse,
             search_role,
             search_user,
+            search_tabular,
             set_namespace_protection,
             set_table_protection,
             set_task_queue_config,
@@ -179,7 +185,7 @@ pub mod v1 {
         secret_store: PhantomData<S>,
     }
 
-    /// ServerInfo
+    /// Get Server Info
     ///
     /// Returns basic information about the server configuration and status.
     #[utoipa::path(
@@ -1055,19 +1061,19 @@ pub mod v1 {
     /// Statistics are aggregated hourly when changes occur.
     ///
     /// We lazily create a new statistics entry every hour, in between hours, the existing entry is
-    /// being updated. If there's a change at created_at + 1 hour, a new entry is created.
+    /// being updated. If there's a change at `created_at + 1 hour`, a new entry is created.
     /// If there's been no change, no new entry is created, meaning there may be gaps.
     ///
     /// Example:
     /// - 00:16:32: warehouse created:
-    ///     - timestamp: 01:00:00, created_at: 00:16:32, updated_at: null, 0 tables, 0 views
+    ///     - `timestamp: 01:00:00, created_at: 00:16:32, updated_at: null, 0 tables, 0 views`
     /// - 00:30:00: table created:
-    ///     - timestamp: 01:00:00, created_at: 00:16:32, updated_at: 00:30:00, 1 table, 0 views
+    ///     - `timestamp: 01:00:00, created_at: 00:16:32, updated_at: 00:30:00, 1 table, 0 views`
     /// - 00:45:00: view created:
-    ///     - timestamp: 01:00:00, created_at: 00:16:32, updated_at: 00:45:00, 1 table, 1 view
+    ///     - `timestamp: 01:00:00, created_at: 00:16:32, updated_at: 00:45:00, 1 table, 1 view`
     /// - 01:00:36: table deleted:
-    ///     - timestamp: 02:00:00, created_at: 01:00:36, updated_at: null, 0 tables, 1 view
-    ///     - timestamp: 01:00:00, created_at: 00:16:32, updated_at: 00:45:00, 1 table, 1 view
+    ///     - `timestamp: 02:00:00, created_at: 01:00:36, updated_at: null, 0 tables, 1 view`
+    ///     - `timestamp: 01:00:00, created_at: 00:16:32, updated_at: 00:45:00, 1 table, 1 view`
     #[utoipa::path(
         get,
         tag = "warehouse",
@@ -1123,19 +1129,15 @@ pub mod v1 {
     ///
     /// Example:
     /// - 00:00:00-00:16:32: no activity
-    ///     - timestamps: []
+    ///     - `timestamps: []`
     /// - 00:16:32: warehouse created:
-    ///     - timestamps: ["01:00:00"], called_endpoints: [[{"count": 1, "http_route": "POST /management/v1/warehouse", "status_code": 201, "warehouse_id": null, "warehouse_name": null, "created_at": "00:16:32", "updated_at": null}]]
+    ///     `{timestamps: ["01:00:00"], called_endpoints: [[{"count": 1, "http_route": "POST /management/v1/warehouse", "status_code": 201, "warehouse_id": null, "warehouse_name": null, "created_at": "00:16:32", "updated_at": null}]]}`
     /// - 00:30:00: table created:
-    ///     - timestamps: ["01:00:00"], called_endpoints: [[{"count": 1, "http_route": "POST /management/v1/warehouse", "status_code": 201, "warehouse_id": null, "warehouse_name": null, "created_at": "00:16:32", "updated_at": null},
-    ///                                                  {"count": 1, "http_route": "POST /catalog/v1/{prefix}/namespaces/{namespace}/tables", "status_code": 201, "warehouse_id": "ff17f1d0-90ad-4e7d-bf02-be718b78c2ee", "warehouse_name": "staging", "created_at": "00:30:00", "updated_at": null}]]
+    ///     - `timestamps: ["01:00:00"], called_endpoints: [[{"count": 1, "http_route": "POST /management/v1/warehouse", "status_code": 201, "warehouse_id": null, "warehouse_name": null, "created_at": "00:16:32", "updated_at": null}, {"count": 1, "http_route": "POST /catalog/v1/{prefix}/namespaces/{namespace}/tables", "status_code": 201, "warehouse_id": "ff17f1d0-90ad-4e7d-bf02-be718b78c2ee", "warehouse_name": "staging", "created_at": "00:30:00", "updated_at": null}]]`
     /// - 00:45:00: table created:
-    ///     - timestamps: ["01:00:00"], called_endpoints: [[{"count": 1, "http_route": "POST /management/v1/warehouse", "status_code": 201, "warehouse_id": null, "warehouse_name": null, "created_at": "00:16:32", "updated_at": null},
-    ///                                                  {"count": 1, "http_route": "POST /catalog/v1/{prefix}/namespaces/{namespace}/tables", "status_code": 201, "warehouse_id": "ff17f1d0-90ad-4e7d-bf02-be718b78c2ee", "warehouse_name": "staging", "created_at": "00:30:00", "updated_at": "00:45:00"}]]
+    ///     - `timestamps: ["01:00:00"], called_endpoints: [[{"count": 1, "http_route": "POST /management/v1/warehouse", "status_code": 201, "warehouse_id": null, "warehouse_name": null, "created_at": "00:16:32", "updated_at": null}, {"count": 1, "http_route": "POST /catalog/v1/{prefix}/namespaces/{namespace}/tables", "status_code": 201, "warehouse_id": "ff17f1d0-90ad-4e7d-bf02-be718b78c2ee", "warehouse_name": "staging", "created_at": "00:30:00", "updated_at": "00:45:00"}]]`
     /// - 01:00:36: table deleted:
-    ///     - timestamps: ["01:00:00","02:00:00"], called_endpoints: [[{"count": 1, "http_route": "POST /management/v1/warehouse", "status_code": 201, "warehouse_id": null, "warehouse_name": null, "created_at": "00:16:32", "updated_at": null},
-    ///                                                  {"count": 1, "http_route": "POST /catalog/v1/{prefix}/namespaces/{namespace}/tables", "status_code": 201, "warehouse_id": "ff17f1d0-90ad-4e7d-bf02-be718b78c2ee", "warehouse_name": "staging", "created_at": "00:30:00", "updated_at": "00:45:00"}],
-    ///                                                   [{"count": 1, "http_route": "DELETE /catalog/v1/{prefix}/namespaces/{namespace}/tables/{table}", "status_code": 200, "warehouse_id": "ff17f1d0-90ad-4e7d-bf02-be718b78c2ee", "warehouse_name": "staging", "created_at": "01:00:36", "updated_at": "null"}]]
+    ///     - `timestamps: ["01:00:00","02:00:00"], called_endpoints: [[{"count": 1, "http_route": "POST /management/v1/warehouse", "status_code": 201, "warehouse_id": null, "warehouse_name": null, "created_at": "00:16:32", "updated_at": null},{"count": 1, "http_route": "POST /catalog/v1/{prefix}/namespaces/{namespace}/tables", "status_code": 201, "warehouse_id": "ff17f1d0-90ad-4e7d-bf02-be718b78c2ee", "warehouse_name": "staging", "created_at": "00:30:00", "updated_at": "00:45:00"}],[{"count": 1, "http_route": "DELETE /catalog/v1/{prefix}/namespaces/{namespace}/tables/{table}", "status_code": 200, "warehouse_id": "ff17f1d0-90ad-4e7d-bf02-be718b78c2ee", "warehouse_name": "staging", "created_at": "01:00:36", "updated_at": "null"}]]`
     #[utoipa::path(
         post,
         tag = "project",
@@ -1152,6 +1154,34 @@ pub mod v1 {
         Json(query): Json<GetEndpointStatisticsRequest>,
     ) -> Result<Json<EndpointStatisticsResponse>> {
         ApiServer::<C, A, S>::get_endpoint_statistics(api_context, query, metadata)
+            .await
+            .map(Json)
+    }
+
+    /// Search Tabulars
+    ///
+    /// Performs a fuzzy search for tabulars based on the provided criteria. If the search string
+    /// can be parsed as uuid:
+    /// - if there is tabular with that uuid, the tabular is in the response
+    /// - if there is a namespace with that uuid, tables in that namespace are in the response
+    #[utoipa::path(
+        post,
+        tag = "warehouse",
+        path = ManagementV1Endpoint::SearchTabular.path(),
+        params(("warehouse_id" = Uuid,)),
+        request_body = SearchTabularRequest,
+        responses(
+            (status = 200, description = "List of tabulars", body = SearchTabularResponse),
+            (status = "4XX", body = IcebergErrorResponse),
+        )
+    )]
+    async fn search_tabular<C: Catalog, A: Authorizer, S: SecretStore>(
+        Path(warehouse_id): Path<uuid::Uuid>,
+        AxumState(api_context): AxumState<ApiContext<State<A, C, S>>>,
+        Extension(metadata): Extension<RequestMetadata>,
+        Json(request): Json<SearchTabularRequest>,
+    ) -> Result<Json<SearchTabularResponse>> {
+        ApiServer::<C, A, S>::search_tabular(warehouse_id.into(), api_context, metadata, request)
             .await
             .map(Json)
     }
@@ -1683,6 +1713,72 @@ pub mod v1 {
             utoipa_schema,
         } in queue_api_configs
         {
+            let mut set_queue_config_schema = SetTaskQueueConfigRequest::schema();
+            let mut get_queue_config_schema = GetTaskQueueConfigResponse::schema();
+            let set_queue_config_type_name = format!("Set{utoipa_type_name}");
+            let get_queue_config_type_name = format!("Get{utoipa_type_name}");
+            let queue_config_type_ref = RefOr::Ref(
+                utoipa::openapi::schema::RefBuilder::new()
+                    .ref_location_from_schema_name(utoipa_type_name.to_string())
+                    .build(),
+            );
+            let set_queue_config_type_ref = RefOr::Ref(
+                utoipa::openapi::schema::RefBuilder::new()
+                    .ref_location_from_schema_name(set_queue_config_type_name.clone())
+                    .build(),
+            );
+            let get_queue_config_type_ref = RefOr::Ref(
+                utoipa::openapi::schema::RefBuilder::new()
+                    .ref_location_from_schema_name(get_queue_config_type_name.clone())
+                    .build(),
+            );
+
+            // replace the "queue-config" property with a ref to the actual queue config type
+            match &mut set_queue_config_schema {
+                RefOr::Ref(_) => {
+                    unreachable!(
+                        "The schema for SetTaskQueueConfigRequest should not be a reference."
+                    );
+                }
+                RefOr::T(s) => match s {
+                    utoipa::openapi::schema::Schema::Object(obj) => {
+                        let ins = obj
+                            .properties
+                            .insert("queue-config".to_string(), queue_config_type_ref.clone());
+                        if ins.is_none() {
+                            unreachable!("The schema for SetTaskQueueConfigRequest should have a 'queue-config' property.");
+                        }
+                    }
+                    _ => {
+                        unreachable!(
+                            "The schema for SetTaskQueueConfigRequest should be an object."
+                        );
+                    }
+                },
+            }
+            match &mut get_queue_config_schema {
+                RefOr::Ref(_) => {
+                    unreachable!(
+                        "The schema for GetTaskQueueConfigResponse should not be a reference."
+                    );
+                }
+                RefOr::T(s) => match s {
+                    utoipa::openapi::schema::Schema::Object(obj) => {
+                        let ins = obj
+                            .properties
+                            .insert("queue-config".to_string(), queue_config_type_ref.clone());
+                        if ins.is_none() {
+                            unreachable!("The schema for GetTaskQueueConfigResponse should have a 'queue-config' property.");
+                        }
+                    }
+                    _ => {
+                        unreachable!(
+                            "The schema for GetTaskQueueConfigResponse should be an object."
+                        );
+                    }
+                },
+            }
+
             let path = ManagementV1Endpoint::SetTaskQueueConfig
                 .path()
                 .replace("{queue_name}", queue_name);
@@ -1716,11 +1812,7 @@ pub mod v1 {
             body.content.insert(
                 "application/json".to_string(),
                 utoipa::openapi::ContentBuilder::new()
-                    .schema(Some(RefOr::Ref(
-                        utoipa::openapi::schema::RefBuilder::new()
-                            .ref_location_from_schema_name(utoipa_type_name.to_string())
-                            .build(),
-                    )))
+                    .schema(Some(set_queue_config_type_ref))
                     .build(),
             );
             let Some(get) = p.get.as_mut() else {
@@ -1744,11 +1836,7 @@ pub mod v1 {
                 .content(
                     "application/json",
                     utoipa::openapi::content::ContentBuilder::new()
-                        .schema(Some(RefOr::Ref(
-                            utoipa::openapi::schema::RefBuilder::new()
-                                .ref_location_from_schema_name(utoipa_type_name.to_string())
-                                .build(),
-                        )))
+                        .schema(Some(get_queue_config_type_ref))
                         .build(),
                 )
                 .header(
@@ -1775,6 +1863,20 @@ pub mod v1 {
             comps
                 .schemas
                 .insert(utoipa_type_name.to_string(), utoipa_schema.clone());
+            comps
+                .schemas
+                .insert(set_queue_config_type_name, set_queue_config_schema);
+            comps
+                .schemas
+                .insert(get_queue_config_type_name, get_queue_config_schema);
+
+            // Remove original SetTaskQueueConfigRequest and GetTaskQueueConfigResponse schemas
+            comps
+                .schemas
+                .remove(&SetTaskQueueConfigRequest::name().to_string());
+            comps
+                .schemas
+                .remove(&GetTaskQueueConfigResponse::name().to_string());
         }
 
         doc
@@ -1860,6 +1962,10 @@ pub mod v1 {
                 .route(
                     "/warehouse/{warehouse_id}/statistics",
                     get(get_warehouse_statistics),
+                )
+                .route(
+                    ManagementV1Endpoint::SearchTabular.path_in_management_v1(),
+                    post(search_tabular),
                 )
                 .route(
                     "/warehouse/{warehouse_id}/deleted-tabulars",

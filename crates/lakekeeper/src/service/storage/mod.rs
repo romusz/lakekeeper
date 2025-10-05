@@ -32,7 +32,7 @@ use crate::{
     request_metadata::RequestMetadata,
     service::{
         storage::error::{IcebergFileIoError, UnexpectedStorageType},
-        tabular_idents::TabularId,
+        TabularId,
     },
     WarehouseId, CONFIG,
 };
@@ -965,7 +965,7 @@ mod tests {
 
         let namespace_id: NamespaceId = uuid::uuid!("00000000-0000-0000-0000-000000000001").into();
         let namespace_location = profile.default_namespace_location(namespace_id).unwrap();
-        let table_id = TabularId::View(uuid::uuid!("00000000-0000-0000-0000-000000000002"));
+        let table_id = TabularId::View(uuid::uuid!("00000000-0000-0000-0000-000000000002").into());
         let table_location = profile.default_tabular_location(&namespace_location, table_id);
         assert_eq!(table_location.to_string(), target_location);
 
@@ -1259,7 +1259,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     fn generate_table_metadata() -> TableMetadata {
         TableMetadataBuilder::new(
             Schema::builder().build().expect("Failed to build schema"),
@@ -1275,7 +1274,7 @@ mod tests {
         .metadata
     }
 
-    #[allow(dead_code, clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     async fn test_profile_io(cred: &StorageCredential, profile: &mut StorageProfile) {
         profile
             .normalize(Some(cred))
@@ -1310,7 +1309,7 @@ mod tests {
         );
     }
 
-    #[allow(dead_code, clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     async fn test_profile_vended_creds(cred: &StorageCredential, profile: &mut StorageProfile) {
         profile
             .normalize(Some(cred))

@@ -1,11 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
 use iceberg::{
-    spec::{TableMetadata, ViewMetadata},
+    spec::{TableMetadata, TableMetadataRef, ViewMetadata},
     TableUpdate,
 };
 use iceberg_ext::catalog::rest::{CatalogConfig, ErrorModel};
@@ -22,10 +22,14 @@ pub use crate::api::iceberg::v1::{
 };
 use crate::{
     api::{
-        iceberg::v1::{namespace::NamespaceDropFlags, PaginatedMapping, PaginationQuery},
+        iceberg::v1::{
+            namespace::NamespaceDropFlags, tables::LoadTableFilters, PaginatedMapping,
+            PaginationQuery,
+        },
         management::v1::{
             project::{EndpointStatisticsResponse, TimeWindowSelector, WarehouseFilter},
             role::{ListRolesResponse, Role, SearchRoleResponse},
+            tabular::SearchTabularResponse,
             tasks::{GetTaskDetailsResponse, ListTasksRequest, ListTasksResponse},
             user::{ListUsersResponse, SearchUserResponse, User, UserLastUpdatedWith, UserType},
             warehouse::{
@@ -41,12 +45,11 @@ use crate::{
         authn::UserId,
         authz::TableUuid,
         health::HealthExt,
-        tabular_idents::{TabularId, TabularIdentOwned},
         task_queue::{
             Task, TaskAttemptId, TaskCheckState, TaskEntity, TaskFilter, TaskId, TaskInput,
             TaskQueueName,
         },
-        ServerId,
+        ServerId, TabularId, TabularIdentOwned,
     },
     SecretIdent,
 };
@@ -171,10 +174,10 @@ pub struct GetProjectResponse {
 
 #[derive(Debug, Clone)]
 pub struct TableCommit {
-    pub new_metadata: TableMetadata,
+    pub new_metadata: TableMetadataRef,
     pub new_metadata_location: Location,
     pub previous_metadata_location: Option<Location>,
-    pub updates: Vec<TableUpdate>,
+    pub updates: Arc<Vec<TableUpdate>>,
     pub diffs: TableMetadataDiffs,
 }
 
@@ -472,6 +475,7 @@ where
         warehouse_id: WarehouseId,
         tables: impl IntoIterator<Item = TableId> + Send,
         include_deleted: bool,
+        filters: &LoadTableFilters,
         transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
     ) -> Result<HashMap<TableId, LoadTableResponse>>;
 
@@ -517,12 +521,12 @@ where
         transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
     ) -> Result<String>;
 
-    /// Undrop a table.
+    /// Undrop a table or view.
     ///
     /// Undrops a soft-deleted table. Does not work if the table was hard-deleted.
     /// Returns the task id of the expiration task associated with the soft-deletion.
     async fn clear_tabular_deleted_at(
-        table_id: &[TableId],
+        tabular_id: &[TabularId],
         warehouse_id: WarehouseId,
         transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
     ) -> Result<Vec<UndropTabularResponse>>;
@@ -805,6 +809,12 @@ where
         pagination_query: PaginationQuery,
     ) -> Result<PaginatedMapping<TabularId, TabularInfo>>;
 
+    async fn search_tabular(
+        warehouse_id: WarehouseId,
+        search_term: &str,
+        catalog_state: Self::State,
+    ) -> Result<SearchTabularResponse>;
+
     async fn load_storage_profile(
         warehouse_id: WarehouseId,
         tabular_id: TableId,
@@ -864,7 +874,7 @@ where
     }
 
     /// Resolve tasks among all known active and historical tasks.
-    /// Returns a map of task_id to (TaskEntity, queue_name).
+    /// Returns a map of `task_id` to `(TaskEntity, queue_name)`.
     /// If `warehouse_id` is `Some`, only resolve tasks for that warehouse.
     async fn resolve_tasks_impl(
         warehouse_id: Option<WarehouseId>,
@@ -873,7 +883,7 @@ where
     ) -> Result<HashMap<TaskId, (TaskEntity, TaskQueueName)>>;
 
     /// Resolve tasks among all known active and historical tasks.
-    /// Returns a map of task_id to (TaskEntity, queue_name).
+    /// Returns a map of `task_id` to `(TaskEntity, queue_name)`.
     /// If a task does not exist, it is not included in the map.
     async fn resolve_tasks(
         warehouse_id: Option<WarehouseId>,
@@ -891,7 +901,10 @@ where
                         TaskEntity::Table {
                             warehouse_id: wid, ..
                         } if *wid != w => continue,
-                        TaskEntity::Table { .. } => (),
+                        TaskEntity::View {
+                            warehouse_id: wid, ..
+                        } if *wid != w => continue,
+                        TaskEntity::View { .. } | TaskEntity::Table { .. } => (),
                     }
                 }
                 cached_results.insert(*id, cached_value);
@@ -1095,7 +1108,7 @@ where
     async fn get_task_queue_config(
         warehouse_id: WarehouseId,
         queue_name: &TaskQueueName,
-        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
+        state: Self::State,
     ) -> Result<Option<GetTaskQueueConfigResponse>>;
 }
 

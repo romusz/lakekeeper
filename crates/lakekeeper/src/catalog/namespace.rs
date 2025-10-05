@@ -16,7 +16,7 @@ use crate::{
             GetNamespaceResponse, ListNamespacesQuery, ListNamespacesResponse, NamespaceParameters,
             Prefix, Result, UpdateNamespacePropertiesRequest, UpdateNamespacePropertiesResponse,
         },
-        management::v1::{warehouse::TabularDeleteProfile, TabularType},
+        management::v1::warehouse::TabularDeleteProfile,
         set_not_found_status_code,
     },
     catalog,
@@ -28,7 +28,7 @@ use crate::{
             tabular_purge_queue::{TabularPurgePayload, TabularPurgeTask},
             EntityId, TaskFilter, TaskMetadata,
         },
-        Catalog, GetWarehouseResponse, NamedEntity, NamespaceId, State, TabularId, Transaction,
+        Catalog, GetWarehouseResponse, NamedEntity, NamespaceId, State, Transaction,
     },
     WarehouseId, CONFIG,
 };
@@ -53,7 +53,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
         request_metadata: RequestMetadata,
     ) -> Result<ListNamespacesResponse> {
         // ------------------- VALIDATIONS -------------------
-        let warehouse_id = require_warehouse_id(prefix)?;
+        let warehouse_id = require_warehouse_id(prefix.as_ref())?;
         let ListNamespacesQuery {
             page_token: _,
             page_size: _,
@@ -194,7 +194,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
         request_metadata: RequestMetadata,
     ) -> Result<CreateNamespaceResponse> {
         // ------------------- VALIDATIONS -------------------
-        let warehouse_id = require_warehouse_id(prefix)?;
+        let warehouse_id = require_warehouse_id(prefix.as_ref())?;
         let CreateNamespaceRequest {
             namespace,
             properties,
@@ -299,7 +299,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
     ) -> Result<GetNamespaceResponse> {
         let GetNamespacePropertiesQuery { return_uuid } = query;
         // ------------------- VALIDATIONS -------------------
-        let warehouse_id = require_warehouse_id(parameters.prefix)?;
+        let warehouse_id = require_warehouse_id(parameters.prefix.as_ref())?;
         validate_namespace_ident(&parameters.namespace)?;
 
         // ------------------- AUTHZ -------------------
@@ -335,7 +335,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
         request_metadata: RequestMetadata,
     ) -> Result<()> {
         //  ------------------- VALIDATIONS -------------------
-        let warehouse_id = require_warehouse_id(parameters.prefix)?;
+        let warehouse_id = require_warehouse_id(parameters.prefix.as_ref())?;
 
         //  ------------------- AUTHZ -------------------
         let authorizer = state.v1_state.authz.clone();
@@ -362,7 +362,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
         request_metadata: RequestMetadata,
     ) -> Result<()> {
         //  ------------------- VALIDATIONS -------------------
-        let warehouse_id = require_warehouse_id(parameters.prefix)?;
+        let warehouse_id = require_warehouse_id(parameters.prefix.as_ref())?;
         validate_namespace_ident(&parameters.namespace)?;
 
         if CONFIG
@@ -419,7 +419,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
         request_metadata: RequestMetadata,
     ) -> Result<UpdateNamespacePropertiesResponse> {
         //  ------------------- VALIDATIONS -------------------
-        let warehouse_id = require_warehouse_id(parameters.prefix)?;
+        let warehouse_id = require_warehouse_id(parameters.prefix.as_ref())?;
         validate_namespace_ident(&parameters.namespace)?;
         let UpdateNamespacePropertiesRequest { removals, updates } = request;
         updates
@@ -491,22 +491,15 @@ async fn try_recursive_drop<A: Authorizer, C: Catalog, S: SecretStore>(
 
         if flags.purge {
             for (tabular_id, tabular_location, tabular_ident) in drop_info.child_tables {
-                let (tabular_id, tabular_type) = match tabular_id {
-                    TabularId::Table(id) => (id, TabularType::Table),
-                    TabularId::View(id) => (id, TabularType::View),
-                };
                 TabularPurgeTask::schedule_task::<C>(
                     TaskMetadata {
                         warehouse_id,
-                        entity_id: EntityId::Tabular(tabular_id),
+                        entity_id: EntityId::from(tabular_id),
                         parent_task_id: None,
                         schedule_for: None,
                         entity_name: tabular_ident.into_name_parts(),
                     },
-                    TabularPurgePayload {
-                        tabular_location,
-                        tabular_type,
-                    },
+                    TabularPurgePayload { tabular_location },
                     t.transaction(),
                 )
                 .await?;

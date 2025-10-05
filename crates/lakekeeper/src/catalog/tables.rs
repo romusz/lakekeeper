@@ -9,20 +9,22 @@ use fxhash::FxHashSet;
 use http::StatusCode;
 use iceberg::{
     spec::{
-        FormatVersion, MetadataLog, SchemaId, SortOrder, TableMetadata, TableMetadataBuildResult,
-        TableMetadataBuilder, UnboundPartitionSpec, PROPERTY_FORMAT_VERSION,
+        MetadataLog, SchemaId, TableMetadata, TableMetadataBuildResult, TableMetadataRef,
         PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX,
     },
     ErrorKind, NamespaceIdent, TableUpdate,
 };
 use iceberg_ext::{
     catalog::rest::{IcebergErrorResponse, LoadCredentialsResponse, StorageCredential},
-    configs::{namespace::NamespaceProperties, ParseFromStr},
+    configs::ParseFromStr,
 };
 use itertools::Itertools;
-use lakekeeper_io::{InvalidLocationError, Location};
+use lakekeeper_io::Location;
 use serde::Serialize;
 use uuid::Uuid;
+
+pub(crate) mod create_table;
+mod load_table;
 
 use super::{
     commit_tables::apply_commit,
@@ -36,13 +38,14 @@ use crate::{
         iceberg::{
             types::DropParams,
             v1::{
-                tables::DataAccessMode, ApiContext, CommitTableRequest, CommitTableResponse,
-                CommitTransactionRequest, CreateTableRequest, DataAccess, ErrorModel,
-                ListTablesQuery, ListTablesResponse, LoadTableResult, NamespaceParameters, Prefix,
-                RegisterTableRequest, RenameTableRequest, Result, TableIdent, TableParameters,
+                tables::{DataAccessMode, LoadTableFilters},
+                ApiContext, CommitTableRequest, CommitTableResponse, CommitTransactionRequest,
+                CreateTableRequest, DataAccess, ErrorModel, ListTablesQuery, ListTablesResponse,
+                LoadTableResult, NamespaceParameters, Prefix, RegisterTableRequest,
+                RenameTableRequest, Result, TableIdent, TableParameters,
             },
         },
-        management::v1::{warehouse::TabularDeleteProfile, DeleteKind, TabularType},
+        management::v1::{warehouse::TabularDeleteProfile, DeleteKind},
         set_not_found_status_code,
     },
     catalog::{self, compression_codec::CompressionCodec, tabular::list_entities},
@@ -51,15 +54,14 @@ use crate::{
         authz::{Authorizer, CatalogNamespaceAction, CatalogTableAction, CatalogWarehouseAction},
         contract_verification::{ContractVerification, ContractVerificationOutcome},
         secrets::SecretStore,
-        storage::{StorageLocations as _, StoragePermissions, StorageProfile, ValidationError},
+        storage::{StorageLocations as _, StoragePermissions},
         task_queue::{
             tabular_expiration_queue::{TabularExpirationPayload, TabularExpirationTask},
             tabular_purge_queue::{TabularPurgePayload, TabularPurgeTask},
             EntityId, TaskMetadata,
         },
-        Catalog, CreateTableResponse, GetNamespaceResponse, ListFlags,
-        LoadTableResponse as CatalogLoadTableResult, NamedEntity, State, TableCommit,
-        TableCreation, TableId, TabularDetails, TabularId, Transaction, WarehouseStatus,
+        Catalog, CreateTableResponse, ListFlags, NamedEntity, State, TableCommit, TableCreation,
+        TableId, TabularDetails, TabularId, Transaction, WarehouseStatus,
     },
     WarehouseId,
 };
@@ -86,7 +88,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
         let return_uuids = query.return_uuids;
         // ------------------- VALIDATIONS -------------------
         let NamespaceParameters { namespace, prefix } = parameters;
-        let warehouse_id = require_warehouse_id(prefix)?;
+        let warehouse_id = require_warehouse_id(prefix.as_ref())?;
         validate_namespace_ident(&namespace)?;
 
         // ------------------- AUTHZ -------------------
@@ -139,174 +141,12 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
     /// Create a table in the given namespace
     async fn create_table(
         parameters: NamespaceParameters,
-        // mut because we need to change location
-        mut request: CreateTableRequest,
+        request: CreateTableRequest,
         data_access: impl Into<DataAccessMode> + Send,
         state: ApiContext<State<A, C, S>>,
         request_metadata: RequestMetadata,
     ) -> Result<LoadTableResult> {
-        let data_access = data_access.into();
-        // ------------------- VALIDATIONS -------------------
-        let NamespaceParameters { namespace, prefix } = parameters.clone();
-        let warehouse_id = require_warehouse_id(prefix.clone())?;
-        let table = TableIdent::new(namespace.clone(), request.name.clone());
-        validate_table_or_view_ident(&table)?;
-
-        if let Some(properties) = &request.properties {
-            validate_table_properties(properties.keys())?;
-        }
-
-        // ------------------- AUTHZ -------------------
-        let authorizer = state.v1_state.authz.clone();
-        let mut t = C::Transaction::begin_write(state.v1_state.catalog).await?;
-        let namespace_id = authorized_namespace_ident_to_id::<C, _>(
-            authorizer.clone(),
-            &request_metadata,
-            &warehouse_id,
-            &namespace,
-            CatalogNamespaceAction::CanCreateTable,
-            t.transaction(),
-        )
-        .await?;
-
-        // ------------------- BUSINESS LOGIC -------------------
-        let id = Uuid::now_v7();
-        let tabular_id = TabularId::Table(id);
-        let table_id = TableId::from(id);
-
-        let namespace = C::get_namespace(warehouse_id, namespace_id, t.transaction()).await?;
-        let warehouse = C::require_warehouse(warehouse_id, t.transaction()).await?;
-        let storage_profile = &warehouse.storage_profile;
-        require_active_warehouse(warehouse.status)?;
-
-        let table_location = determine_tabular_location(
-            &namespace,
-            request.location.clone(),
-            tabular_id,
-            storage_profile,
-        )?;
-
-        // Update the request for event
-        request.location = Some(table_location.to_string());
-        let request = request; // Make it non-mutable again for our sanity
-
-        // If stage-create is true, we should not create the metadata file
-        let metadata_location = if request.stage_create.unwrap_or(false) {
-            None
-        } else {
-            let metadata_id = Uuid::now_v7();
-            Some(storage_profile.default_metadata_location(
-                &table_location,
-                &CompressionCodec::try_from_maybe_properties(request.properties.as_ref())?,
-                metadata_id,
-                0,
-            ))
-        };
-
-        let table_metadata = create_table_request_into_table_metadata(table_id, request.clone())?;
-
-        let CreateTableResponse {
-            table_metadata,
-            staged_table_id,
-        } = C::create_table(
-            TableCreation {
-                warehouse_id: warehouse.id,
-                namespace_id: namespace.namespace_id,
-                table_ident: &table,
-                table_metadata,
-                metadata_location: metadata_location.as_ref(),
-            },
-            t.transaction(),
-        )
-        .await?;
-
-        // We don't commit the transaction yet, first we need to write the metadata file.
-        let storage_secret = if let Some(secret_id) = warehouse.storage_secret_id {
-            let secret_state = state.v1_state.secrets;
-            Some(secret_state.get_secret_by_id(secret_id).await?.secret)
-        } else {
-            None
-        };
-
-        let file_io = storage_profile.file_io(storage_secret.as_ref()).await?;
-        if !crate::service::storage::is_empty(&file_io, &table_location).await? {
-            return Err(ValidationError::from(InvalidLocationError::new(
-                table_location.to_string(),
-                "Unexpected files in location, tabular locations have to be empty",
-            ))
-            .into());
-        }
-
-        if let Some(metadata_location) = &metadata_location {
-            let compression_codec = CompressionCodec::try_from_metadata(&table_metadata)?;
-            write_file(
-                &file_io,
-                metadata_location,
-                &table_metadata,
-                compression_codec,
-            )
-            .await?;
-        }
-
-        // This requires the storage secret
-        // because the table config might contain vended-credentials based
-        // on the `data_access` parameter.
-        let config = storage_profile
-            .generate_table_config(
-                data_access,
-                storage_secret.as_ref(),
-                &table_location,
-                StoragePermissions::ReadWriteDelete,
-                &request_metadata,
-                warehouse_id,
-                table_id.into(),
-            )
-            .await?;
-
-        let storage_credentials = (!config.creds.inner().is_empty()).then(|| {
-            vec![StorageCredential {
-                prefix: table_location.to_string(),
-                config: config.creds.into(),
-            }]
-        });
-
-        let load_table_result = LoadTableResult {
-            metadata_location: metadata_location.as_ref().map(ToString::to_string),
-            metadata: table_metadata.clone(),
-            config: Some(config.config.into()),
-            storage_credentials,
-        };
-
-        authorizer
-            .create_table(&request_metadata, warehouse_id, table_id, namespace_id)
-            .await?;
-
-        // Metadata file written, now we can commit the transaction
-        t.commit().await?;
-
-        // If a staged table was overwritten, delete it from authorizer
-        if let Some(staged_table_id) = staged_table_id {
-            authorizer
-                .delete_table(warehouse_id, staged_table_id)
-                .await
-                .ok();
-        }
-
-        state
-            .v1_state
-            .hooks
-            .create_table(
-                warehouse_id,
-                parameters,
-                Arc::new(request),
-                Arc::new(table_metadata),
-                metadata_location.map(Arc::new),
-                data_access,
-                Arc::new(request_metadata),
-            )
-            .await;
-
-        Ok(load_table_result)
+        create_table::create_table(parameters, request, data_access, state, request_metadata).await
     }
 
     /// Register a table in the given namespace using given metadata file location
@@ -319,7 +159,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
     ) -> Result<LoadTableResult> {
         // ------------------- VALIDATIONS -------------------
         let NamespaceParameters { namespace, prefix } = &parameters;
-        let warehouse_id = require_warehouse_id(prefix.clone())?;
+        let warehouse_id = require_warehouse_id(prefix.as_ref())?;
         let table = TableIdent::new(namespace.clone(), request.name.clone());
         validate_table_or_view_ident(&table)?;
         let metadata_location =
@@ -494,103 +334,11 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
     async fn load_table(
         parameters: TableParameters,
         data_access: impl Into<DataAccessMode> + Send,
+        filters: LoadTableFilters,
         state: ApiContext<State<A, C, S>>,
         request_metadata: RequestMetadata,
     ) -> Result<LoadTableResult> {
-        // ------------------- VALIDATIONS -------------------
-        let TableParameters { prefix, table } = parameters;
-        let warehouse_id = require_warehouse_id(prefix)?;
-        // It is important to throw a 404 if a table cannot be found,
-        // because spark might check if `table`.`branch` exists, which should return 404.
-        // Only then will it treat it as a branch.
-        if let Err(mut e) = validate_table_or_view_ident(&table) {
-            if e.error.r#type == *"NamespaceDepthExceeded" {
-                e.error.code = StatusCode::NOT_FOUND.into();
-            }
-            return Err(e);
-        }
-
-        let list_flags = ListFlags {
-            include_active: true,
-            include_staged: false,
-            include_deleted: false,
-        };
-
-        // ------------------- AUTHZ -------------------
-        let authorizer = state.v1_state.authz;
-        let catalog = state.v1_state.catalog;
-        let mut t = C::Transaction::begin_read(catalog).await?;
-
-        let (tabular_details, storage_permissions) = Self::resolve_and_authorize_table_access(
-            &request_metadata,
-            &table,
-            warehouse_id,
-            list_flags,
-            authorizer,
-            t.transaction(),
-        )
-        .await?;
-
-        // ------------------- BUSINESS LOGIC -------------------
-        let CatalogLoadTableResult {
-            table_id,
-            namespace_id: _,
-            table_metadata,
-            metadata_location,
-            storage_secret_ident,
-            storage_profile,
-        } = load_table_inner::<C>(
-            warehouse_id,
-            tabular_details.table_id,
-            &table,
-            list_flags.include_deleted,
-            &mut t,
-        )
-        .await?;
-        t.commit().await?;
-
-        let table_location =
-            parse_location(table_metadata.location(), StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        // ToDo: This is a small inefficiency: We fetch the secret even if it might
-        // not be required based on the `data_access` parameter.
-        let storage_config = if let Some(storage_permissions) = storage_permissions {
-            let storage_secret =
-                maybe_get_secret(storage_secret_ident, &state.v1_state.secrets).await?;
-            Some(
-                storage_profile
-                    .generate_table_config(
-                        data_access.into(),
-                        storage_secret.as_ref(),
-                        &table_location,
-                        storage_permissions,
-                        &request_metadata,
-                        warehouse_id,
-                        table_id.into(),
-                    )
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        let storage_credentials = storage_config.as_ref().and_then(|c| {
-            (!c.creds.inner().is_empty()).then(|| {
-                vec![StorageCredential {
-                    prefix: table_location.to_string(),
-                    config: c.creds.clone().into(),
-                }]
-            })
-        });
-
-        let load_table_result = LoadTableResult {
-            metadata_location: metadata_location.as_ref().map(ToString::to_string),
-            metadata: table_metadata,
-            config: storage_config.map(|c| c.config.into()),
-            storage_credentials,
-        };
-
-        Ok(load_table_result)
+        load_table::load_table(parameters, data_access, filters, state, request_metadata).await
     }
 
     async fn load_table_credentials(
@@ -601,10 +349,10 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
     ) -> Result<LoadCredentialsResponse> {
         // ------------------- VALIDATIONS -------------------
         let TableParameters { prefix, table } = parameters;
-        let warehouse_id = require_warehouse_id(prefix)?;
+        let warehouse_id = require_warehouse_id(prefix.as_ref())?;
 
         let mut t = C::Transaction::begin_read(state.v1_state.catalog).await?;
-        let (tabular_details, storage_permissions) = Self::resolve_and_authorize_table_access(
+        let (tabular_details, storage_permissions) = resolve_and_authorize_table_access::<C, A>(
             &request_metadata,
             &table,
             warehouse_id,
@@ -715,7 +463,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
     ) -> Result<()> {
         // ------------------- VALIDATIONS -------------------
         let TableParameters { prefix, table } = &parameters;
-        let warehouse_id = require_warehouse_id(prefix.clone())?;
+        let warehouse_id = require_warehouse_id(prefix.as_ref())?;
         validate_table_or_view_ident(table)?;
 
         // ------------------- AUTHZ -------------------
@@ -761,7 +509,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
         state
             .v1_state
             .contract_verifiers
-            .check_drop(TabularId::Table(*table_id))
+            .check_drop(TabularId::Table(table_id))
             .await?
             .into_result()?;
 
@@ -780,14 +528,13 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
                     TabularPurgeTask::schedule_task::<C>(
                         TaskMetadata {
                             warehouse_id,
-                            entity_id: EntityId::Tabular(*table_id),
+                            entity_id: EntityId::from(table_id),
                             parent_task_id: None,
                             schedule_for: None,
                             entity_name: table.clone().into_name_parts(),
                         },
                         TabularPurgePayload {
                             tabular_location: location,
-                            tabular_type: TabularType::Table,
                         },
                         t.transaction(),
                     )
@@ -807,14 +554,13 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
             TabularDeleteProfile::Soft { expiration_seconds } => {
                 let _ = TabularExpirationTask::schedule_task::<C>(
                     TaskMetadata {
-                        entity_id: EntityId::Tabular(*table_id),
+                        entity_id: EntityId::from(table_id),
                         warehouse_id,
                         parent_task_id: None,
                         schedule_for: Some(chrono::Utc::now() + expiration_seconds),
                         entity_name: table.clone().into_name_parts(),
                     },
                     TabularExpirationPayload {
-                        tabular_type: TabularType::Table,
                         deletion_kind: if purge_requested {
                             DeleteKind::Purge
                         } else {
@@ -827,7 +573,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
 
                 C::mark_tabular_as_deleted(
                     warehouse_id,
-                    TabularId::Table(*table_id),
+                    TabularId::Table(table_id),
                     force,
                     t.transaction(),
                 )
@@ -864,7 +610,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
     ) -> Result<()> {
         // ------------------- VALIDATIONS -------------------
         let TableParameters { prefix, table } = parameters;
-        let warehouse_id = require_warehouse_id(prefix.clone())?;
+        let warehouse_id = require_warehouse_id(prefix.as_ref())?;
         validate_table_or_view_ident(&table)?;
 
         // ------------------- AUTHZ -------------------
@@ -899,7 +645,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
         request_metadata: RequestMetadata,
     ) -> Result<()> {
         // ------------------- VALIDATIONS -------------------
-        let warehouse_id = require_warehouse_id(prefix.clone())?;
+        let warehouse_id = require_warehouse_id(prefix.as_ref())?;
         let RenameTableRequest {
             source,
             destination,
@@ -965,7 +711,7 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
         state
             .v1_state
             .contract_verifiers
-            .check_rename(TabularId::Table(*source_table_id), destination)
+            .check_rename(TabularId::Table(source_table_id), destination)
             .await?
             .into_result()?;
 
@@ -999,81 +745,61 @@ impl<C: Catalog, A: Authorizer + Clone, S: SecretStore>
     }
 }
 
-impl<C: Catalog, A: Authorizer + Clone, S: SecretStore> CatalogServer<C, A, S> {
-    async fn resolve_and_authorize_table_access(
-        request_metadata: &RequestMetadata,
-        table: &TableIdent,
-        warehouse_id: WarehouseId,
-        list_flags: ListFlags,
-        authorizer: A,
-        transaction: <C::Transaction as Transaction<C::State>>::Transaction<'_>,
-    ) -> Result<(TabularDetails, Option<StoragePermissions>)> {
-        authorizer
-            .require_warehouse_action(
-                request_metadata,
-                warehouse_id,
-                CatalogWarehouseAction::CanUse,
-            )
-            .await?;
-
-        // We can't fail before AuthZ.
-        let tabular_details =
-            C::resolve_table_ident(warehouse_id, table, list_flags, transaction).await;
-
-        let tabular_details = authorizer
-            .require_table_action(
-                request_metadata,
-                warehouse_id,
-                tabular_details,
-                CatalogTableAction::CanGetMetadata,
-            )
-            .await
-            .map_err(set_not_found_status_code)?;
-
-        let (read_access, write_access) = futures::try_join!(
-            authorizer.is_allowed_table_action(
-                request_metadata,
-                warehouse_id,
-                tabular_details.table_id,
-                CatalogTableAction::CanReadData,
-            ),
-            authorizer.is_allowed_table_action(
-                request_metadata,
-                warehouse_id,
-                tabular_details.table_id,
-                CatalogTableAction::CanWriteData,
-            ),
-        )?;
-        let can_read = read_access.into_inner();
-        let can_write = write_access.into_inner();
-
-        let storage_permissions = if can_write {
-            Some(StoragePermissions::ReadWriteDelete)
-        } else if can_read {
-            Some(StoragePermissions::Read)
-        } else {
-            None
-        };
-        Ok((tabular_details, storage_permissions))
-    }
-}
-
-/// Load a table from the catalog, ensuring that it is not staged
-///
-/// # Errors
-/// Returns an error if the table is staged, if it cannot be found, or if a DB error occurs.
-async fn load_table_inner<C: Catalog>(
+async fn resolve_and_authorize_table_access<C: Catalog, A: Authorizer + Clone>(
+    request_metadata: &RequestMetadata,
+    table: &TableIdent,
     warehouse_id: WarehouseId,
-    table_id: TableId,
-    table_ident: &TableIdent,
-    include_deleted: bool,
-    t: &mut C::Transaction,
-) -> Result<CatalogLoadTableResult> {
-    let mut metadatas =
-        C::load_tables(warehouse_id, [table_id], include_deleted, t.transaction()).await?;
-    let result = take_table_metadata(&table_id, table_ident, &mut metadatas)?;
-    require_not_staged(result.metadata_location.as_ref())?;
-    Ok(result)
+    list_flags: ListFlags,
+    authorizer: A,
+    transaction: <C::Transaction as Transaction<C::State>>::Transaction<'_>,
+) -> Result<(TabularDetails, Option<StoragePermissions>)> {
+    authorizer
+        .require_warehouse_action(
+            request_metadata,
+            warehouse_id,
+            CatalogWarehouseAction::CanUse,
+        )
+        .await?;
+
+    // We can't fail before AuthZ.
+    let tabular_details =
+        C::resolve_table_ident(warehouse_id, table, list_flags, transaction).await;
+
+    let tabular_details = authorizer
+        .require_table_action(
+            request_metadata,
+            warehouse_id,
+            tabular_details,
+            CatalogTableAction::CanGetMetadata,
+        )
+        .await
+        .map_err(set_not_found_status_code)?;
+
+    let (read_access, write_access) = futures::try_join!(
+        authorizer.is_allowed_table_action(
+            request_metadata,
+            warehouse_id,
+            tabular_details.table_id,
+            CatalogTableAction::CanReadData,
+        ),
+        authorizer.is_allowed_table_action(
+            request_metadata,
+            warehouse_id,
+            tabular_details.table_id,
+            CatalogTableAction::CanWriteData,
+        ),
+    )?;
+    let can_read = read_access.into_inner();
+    let can_write = write_access.into_inner();
+
+    let storage_permissions = if can_write {
+        Some(StoragePermissions::ReadWriteDelete)
+    } else if can_read {
+        Some(StoragePermissions::Read)
+    } else {
+        None
+    };
+    Ok((tabular_details, storage_permissions))
 }
 
 /// Validate commit table requests
@@ -1231,7 +957,7 @@ async fn commit_tables_with_authz<C: Catalog, A: Authorizer + Clone, S: SecretSt
     request_metadata: RequestMetadata,
 ) -> Result<Vec<CommitContext>> {
     // ------------------- VALIDATIONS -------------------
-    let warehouse_id = require_warehouse_id(prefix.clone())?;
+    let warehouse_id = require_warehouse_id(prefix.as_ref())?;
     commit_tables_validate(&request)?;
 
     // ------------------- AUTHZ -------------------
@@ -1320,6 +1046,7 @@ async fn try_commit_tables<
         warehouse_id,
         table_ids.values().copied(),
         include_deleted,
+        &LoadTableFilters::default(),
         transaction.transaction(),
     )
     .await?;
@@ -1385,12 +1112,13 @@ async fn try_commit_tables<
                 .saturating_sub(previous_table_metadata.table_metadata.metadata_log().len());
 
             Ok(CommitContext {
-                new_metadata,
+                new_metadata: Arc::new(new_metadata),
                 new_metadata_location,
+                table_ident: table_ident.clone(),
                 new_compression_codec,
                 previous_metadata_location: previous_table_metadata.metadata_location,
-                updates: change.updates.clone(),
-                previous_metadata: previous_table_metadata.table_metadata,
+                updates: Arc::new(change.updates.clone()),
+                previous_metadata: Arc::new(previous_table_metadata.table_metadata),
                 number_expired_metadata_log_entries,
                 number_added_metadata_log_entries,
             })
@@ -1538,11 +1266,12 @@ pub(crate) fn extract_count_from_metadata_location(location: &Location) -> Optio
 
 #[derive(Clone, Debug)]
 pub struct CommitContext {
-    pub new_metadata: iceberg::spec::TableMetadata,
+    pub new_metadata: TableMetadataRef,
     pub new_metadata_location: Location,
-    pub previous_metadata: iceberg::spec::TableMetadata,
+    pub table_ident: TableIdent,
+    pub previous_metadata: TableMetadataRef,
     pub previous_metadata_location: Option<Location>,
-    pub updates: Vec<TableUpdate>,
+    pub updates: Arc<Vec<TableUpdate>>,
     pub new_compression_codec: CompressionCodec,
     pub number_expired_metadata_log_entries: usize,
     pub number_added_metadata_log_entries: usize,
@@ -1811,44 +1540,6 @@ pub(super) fn parse_location(location: &str, code: StatusCode) -> Result<Locatio
         .map_err(Into::into)
 }
 
-pub(super) fn determine_tabular_location(
-    namespace: &GetNamespaceResponse,
-    request_table_location: Option<String>,
-    table_id: TabularId,
-    storage_profile: &StorageProfile,
-) -> Result<Location> {
-    let request_table_location = request_table_location
-        .map(|l| parse_location(&l, StatusCode::BAD_REQUEST))
-        .transpose()?;
-
-    let mut location = if let Some(location) = request_table_location {
-        storage_profile.require_allowed_location(&location)?;
-        location
-    } else {
-        let namespace_props = NamespaceProperties::from_props_unchecked(
-            namespace.properties.clone().unwrap_or_default(),
-        );
-
-        let namespace_location = match namespace_props.get_location() {
-            Some(location) => location,
-            None => storage_profile
-                .default_namespace_location(namespace.namespace_id)
-                .map_err(|e| {
-                    ErrorModel::internal(
-                        "Failed to generate default namespace location",
-                        "InvalidDefaultNamespaceLocation",
-                        Some(Box::new(e)),
-                    )
-                })?,
-        };
-
-        storage_profile.default_tabular_location(&namespace_location, table_id)
-    };
-    // all locations are without a trailing slash
-    location.without_trailing_slash();
-    Ok(location)
-}
-
 fn require_table_id(table_ident: &TableIdent, table_id: Option<TableId>) -> Result<TableId> {
     table_id.ok_or_else(|| {
         ErrorModel::not_found(
@@ -1993,70 +1684,6 @@ pub(crate) fn maybe_body_to_json(request: impl Serialize) -> serde_json::Value {
     }
 }
 
-pub(crate) fn create_table_request_into_table_metadata(
-    table_id: TableId,
-    request: CreateTableRequest,
-) -> Result<TableMetadata> {
-    let CreateTableRequest {
-        name: _,
-        location,
-        schema,
-        partition_spec,
-        write_order,
-        // Stage-create is already handled in the catalog service.
-        // If stage-create is true, the metadata_location is None,
-        // otherwise, it is the location of the metadata file.
-        stage_create: _,
-        mut properties,
-    } = request;
-
-    let location = location.ok_or_else(|| {
-        ErrorModel::conflict(
-            "Table location is required",
-            "CreateTableLocationRequired",
-            None,
-        )
-    })?;
-
-    let format_version = properties
-        .as_mut()
-        .and_then(|props| props.remove(PROPERTY_FORMAT_VERSION))
-        .map(|s| match s.as_str() {
-            "v1" | "1" => Ok(FormatVersion::V1),
-            "v2" | "2" => Ok(FormatVersion::V2),
-            "v3" | "3" => Ok(FormatVersion::V3),
-            _ => Err(ErrorModel::bad_request(
-                format!("Invalid format version specified in table_properties: {s}"),
-                "InvalidFormatVersion",
-                None,
-            )),
-        })
-        .transpose()?
-        .unwrap_or(FormatVersion::V2);
-
-    let table_metadata = TableMetadataBuilder::new(
-        schema,
-        partition_spec.unwrap_or(UnboundPartitionSpec::builder().build()),
-        write_order.unwrap_or(SortOrder::unsorted_order()),
-        location,
-        format_version,
-        properties.unwrap_or_default(),
-    )
-    .map_err(|e| {
-        let msg = e.message().to_string();
-        ErrorModel::bad_request(msg, "CreateTableMetadataError", Some(Box::new(e)))
-    })?
-    .assign_uuid(*table_id)
-    .build()
-    .map_err(|e| {
-        let msg = e.message().to_string();
-        ErrorModel::bad_request(msg, "BuildTableMetadataError", Some(Box::new(e)))
-    })?
-    .metadata;
-
-    Ok(table_metadata)
-}
-
 #[cfg(test)]
 pub(crate) mod test {
     use std::{collections::HashMap, str::FromStr};
@@ -2085,8 +1712,8 @@ pub(crate) mod test {
             iceberg::{
                 types::{PageToken, Prefix},
                 v1::{
-                    tables::TablesService as _, DataAccess, DropParams, ListTablesQuery,
-                    NamespaceParameters, TableParameters,
+                    tables::{LoadTableFilters, TablesService as _},
+                    DataAccess, DropParams, ListTablesQuery, NamespaceParameters, TableParameters,
                 },
             },
             management::v1::{
@@ -2265,6 +1892,7 @@ pub(crate) mod test {
                 table: table_ident,
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -2392,6 +2020,7 @@ pub(crate) mod test {
                 },
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -2548,6 +2177,7 @@ pub(crate) mod test {
                 },
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -2609,6 +2239,7 @@ pub(crate) mod test {
                 },
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -2689,6 +2320,7 @@ pub(crate) mod test {
                 },
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -2735,6 +2367,7 @@ pub(crate) mod test {
                 table: table_ident.clone(),
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -2777,6 +2410,7 @@ pub(crate) mod test {
                 table: table_ident.clone(),
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -2785,8 +2419,8 @@ pub(crate) mod test {
 
         assert_table_metadata_are_equal(&builder.metadata, &tab.metadata);
 
-        let builder = committed
-            .new_metadata
+        let builder = (*committed.new_metadata)
+            .clone()
             .into_builder(tab.metadata_location)
             .set_properties(HashMap::from_iter(vec![(
                 "change_nr".to_string(),
@@ -2820,6 +2454,7 @@ pub(crate) mod test {
                 table: table_ident.clone(),
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -3125,6 +2760,7 @@ pub(crate) mod test {
                 table: table_ident.clone(),
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -3158,6 +2794,7 @@ pub(crate) mod test {
                 table: table_ident.clone(),
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -3208,6 +2845,7 @@ pub(crate) mod test {
                 table: table_ident.clone(),
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -3287,6 +2925,7 @@ pub(crate) mod test {
                 table: table_ident.clone(),
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -3349,6 +2988,7 @@ pub(crate) mod test {
                 table: table_ident.clone(),
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -3406,6 +3046,7 @@ pub(crate) mod test {
                 table: table_ident.clone(),
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -3444,6 +3085,7 @@ pub(crate) mod test {
                 table: table_ident.clone(),
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )
@@ -4081,7 +3723,7 @@ pub(crate) mod test {
 
         ManagementApiServer::set_table_protection(
             tab.metadata.uuid().into(),
-            WarehouseId::from_str(ns_params.prefix.clone().unwrap().as_str()).unwrap(),
+            WarehouseId::from_str_or_internal(ns_params.prefix.clone().unwrap().as_str()).unwrap(),
             true,
             ctx.clone(),
             random_request_metadata(),
@@ -4107,7 +3749,7 @@ pub(crate) mod test {
 
         ManagementApiServer::set_table_protection(
             tab.metadata.uuid().into(),
-            WarehouseId::from_str(ns_params.prefix.clone().unwrap().as_str()).unwrap(),
+            WarehouseId::from_str_or_internal(ns_params.prefix.clone().unwrap().as_str()).unwrap(),
             false,
             ctx.clone(),
             random_request_metadata(),
@@ -4150,7 +3792,7 @@ pub(crate) mod test {
 
         ManagementApiServer::set_table_protection(
             tab.metadata.uuid().into(),
-            WarehouseId::from_str(ns_params.prefix.clone().unwrap().as_str()).unwrap(),
+            WarehouseId::from_str_or_internal(ns_params.prefix.clone().unwrap().as_str()).unwrap(),
             true,
             ctx.clone(),
             random_request_metadata(),
@@ -4514,6 +4156,7 @@ pub(crate) mod test {
                 table: table_ident,
             },
             DataAccess::not_specified(),
+            LoadTableFilters::default(),
             ctx.clone(),
             RequestMetadata::new_unauthenticated(),
         )

@@ -3,7 +3,6 @@ use std::collections::{HashMap, HashSet};
 use chrono::Duration;
 use iceberg::spec::ViewMetadata;
 use iceberg_ext::catalog::rest::{CatalogConfig, ErrorModel};
-use itertools::Itertools;
 use lakekeeper_io::Location;
 
 use super::{
@@ -27,10 +26,14 @@ use super::{
 };
 use crate::{
     api::{
-        iceberg::v1::{namespace::NamespaceDropFlags, PaginatedMapping, PaginationQuery},
+        iceberg::v1::{
+            namespace::NamespaceDropFlags, tables::LoadTableFilters, PaginatedMapping,
+            PaginationQuery,
+        },
         management::v1::{
             project::{EndpointStatisticsResponse, TimeWindowSelector, WarehouseFilter},
             role::{ListRolesResponse, Role, SearchRoleResponse},
+            tabular::SearchTabularResponse,
             tasks::{GetTaskDetailsResponse, ListTasksRequest, ListTasksResponse},
             user::{ListUsersResponse, SearchUserResponse, UserLastUpdatedWith, UserType},
             warehouse::{
@@ -46,7 +49,7 @@ use crate::{
         role::search_role,
         tabular::{
             clear_tabular_deleted_at, get_tabular_protected, list_tabulars,
-            mark_tabular_as_deleted, set_tabular_protected,
+            mark_tabular_as_deleted, search_tabular, set_tabular_protected,
             table::{commit_table_transaction, create_table, load_storage_profile},
             view::{create_view, drop_view, list_views, load_view, rename_view, view_ident_to_id},
         },
@@ -210,9 +213,10 @@ impl Catalog for super::PostgresCatalog {
         warehouse_id: WarehouseId,
         tables: impl IntoIterator<Item = TableId> + Send,
         include_deleted: bool,
+        filters: &LoadTableFilters,
         transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
     ) -> Result<HashMap<TableId, LoadTableResponse>> {
-        load_tables(warehouse_id, tables, include_deleted, transaction).await
+        load_tables(warehouse_id, tables, include_deleted, filters, transaction).await
     }
 
     async fn get_table_metadata_by_id(
@@ -253,16 +257,11 @@ impl Catalog for super::PostgresCatalog {
     }
 
     async fn clear_tabular_deleted_at(
-        tabular_ids: &[TableId],
+        tabular_ids: &[TabularId],
         warehouse_id: WarehouseId,
         transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
     ) -> Result<Vec<UndropTabularResponse>> {
-        clear_tabular_deleted_at(
-            &tabular_ids.iter().map(|i| **i).collect_vec(),
-            warehouse_id,
-            transaction,
-        )
-        .await
+        clear_tabular_deleted_at(tabular_ids, warehouse_id, transaction).await
     }
 
     async fn mark_tabular_as_deleted(
@@ -643,6 +642,14 @@ impl Catalog for super::PostgresCatalog {
         rename_view(warehouse_id, source_id, source, destination, transaction).await
     }
 
+    async fn search_tabular(
+        warehouse_id: WarehouseId,
+        search_term: &str,
+        catalog_state: Self::State,
+    ) -> Result<SearchTabularResponse> {
+        search_tabular(warehouse_id, search_term, &catalog_state.read_pool()).await
+    }
+
     async fn list_tabulars(
         warehouse_id: WarehouseId,
         namespace_id: Option<NamespaceId>,
@@ -826,8 +833,8 @@ impl Catalog for super::PostgresCatalog {
     async fn get_task_queue_config(
         warehouse_id: WarehouseId,
         queue_name: &TaskQueueName,
-        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
+        state: Self::State,
     ) -> Result<Option<GetTaskQueueConfigResponse>> {
-        get_task_queue_config(transaction, warehouse_id, queue_name).await
+        get_task_queue_config(&state.read_pool(), warehouse_id, queue_name).await
     }
 }

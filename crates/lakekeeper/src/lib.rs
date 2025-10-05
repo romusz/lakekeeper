@@ -22,6 +22,7 @@ pub(crate) mod utils;
 pub mod api;
 mod request_metadata;
 
+pub use async_trait;
 pub use axum;
 pub use iceberg;
 pub use limes;
@@ -47,7 +48,9 @@ pub use utoipa;
 pub mod metrics;
 #[cfg(feature = "router")]
 #[cfg_attr(docsrs, doc(cfg(feature = "router")))]
-pub mod tracing;
+pub mod request_tracing;
+
+pub use tracing;
 
 #[cfg(test)]
 pub mod tests;
@@ -58,7 +61,6 @@ pub mod test {
 
     use tokio::runtime::Runtime;
 
-    #[allow(dead_code)]
     static COMMON_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -67,7 +69,6 @@ pub mod test {
     });
 
     #[track_caller]
-    #[allow(dead_code)]
     pub(crate) fn test_block_on<F: Future>(f: F, common_runtime: bool) -> F::Output {
         {
             if common_runtime {
