@@ -1,6 +1,18 @@
-use axum::{extract::State as AxumState, Extension, Json};
 use http::StatusCode;
-use iceberg::{NamespaceIdent, TableIdent};
+use lakekeeper::{
+    api::{ApiContext, RequestMetadata},
+    axum::{extract::State as AxumState, Extension, Json},
+    catalog::{
+        namespace::authorized_namespace_ident_to_id, tables::authorized_table_ident_to_id,
+        views::authorized_view_ident_to_id,
+    },
+    iceberg::{NamespaceIdent, TableIdent},
+    service::{
+        authz::Authorizer, Catalog, ListFlags, NamespaceId, Result, SecretStore, State, TableId,
+        Transaction, ViewId,
+    },
+    ProjectId, WarehouseId,
+};
 use openfga_client::client::CheckRequestTupleKey;
 use serde::{Deserialize, Serialize};
 
@@ -15,19 +27,7 @@ use super::{
     },
     OpenFGAAuthorizer, OpenFGAError,
 };
-use crate::{
-    api::ApiContext,
-    catalog::{
-        namespace::authorized_namespace_ident_to_id, tables::authorized_table_ident_to_id,
-        views::authorized_view_ident_to_id,
-    },
-    request_metadata::RequestMetadata,
-    service::{
-        authz::{implementations::openfga::entities::OpenFgaEntity, Authorizer},
-        Catalog, ListFlags, NamespaceId, Result, SecretStore, State, TableId, Transaction, ViewId,
-    },
-    ProjectId, WarehouseId,
-};
+use crate::{entities::OpenFgaEntity, relations::ActorExt};
 
 /// Check if a specific action is allowed on the given object
 #[utoipa::path(
@@ -429,18 +429,19 @@ pub(super) struct CheckResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use lakekeeper::service::UserId;
 
     use super::*;
-    use crate::service::UserId;
 
     #[test]
     fn test_serde_check_action_namespace_id() {
         let action = CheckOperation::Namespace {
             action: NamespaceAction::CreateTable,
             namespace: NamespaceIdentOrUuid::Id {
-                namespace_id: NamespaceId::from_str("00000000-0000-0000-0000-000000000000")
-                    .unwrap(),
+                namespace_id: NamespaceId::from_str_or_internal(
+                    "00000000-0000-0000-0000-000000000000",
+                )
+                .unwrap(),
             },
         };
         let json = serde_json::to_value(&action).unwrap();
@@ -461,8 +462,10 @@ mod tests {
             action: TableAction::GetMetadata,
             table: TabularIdentOrUuid::IdInWarehouse {
                 table_id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
-                warehouse_id: WarehouseId::from_str("490cbf7a-cbfe-11ef-84c5-178606d4cab3")
-                    .unwrap(),
+                warehouse_id: WarehouseId::from_str_or_internal(
+                    "490cbf7a-cbfe-11ef-84c5-178606d4cab3",
+                )
+                .unwrap(),
             },
         };
         let json = serde_json::to_value(&action).unwrap();
@@ -484,8 +487,10 @@ mod tests {
             action: ViewAction::GetMetadata,
             view: TabularIdentOrUuid::IdInWarehouse {
                 table_id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
-                warehouse_id: WarehouseId::from_str("490cbf7a-cbfe-11ef-84c5-178606d4cab3")
-                    .unwrap(),
+                warehouse_id: WarehouseId::from_str_or_internal(
+                    "490cbf7a-cbfe-11ef-84c5-178606d4cab3",
+                )
+                .unwrap(),
             },
         };
         let json = serde_json::to_value(&action).unwrap();
@@ -509,8 +514,10 @@ mod tests {
             table: TabularIdentOrUuid::Name {
                 namespace: NamespaceIdent::from_vec(vec!["trino_namespace".to_string()]).unwrap(),
                 table: "trino_table".to_string(),
-                warehouse_id: WarehouseId::from_str("490cbf7a-cbfe-11ef-84c5-178606d4cab3")
-                    .unwrap(),
+                warehouse_id: WarehouseId::from_str_or_internal(
+                    "490cbf7a-cbfe-11ef-84c5-178606d4cab3",
+                )
+                .unwrap(),
             },
         };
         let json = serde_json::to_value(&action).unwrap();
@@ -533,8 +540,10 @@ mod tests {
             action: NamespaceAction::GetMetadata,
             namespace: NamespaceIdentOrUuid::Name {
                 namespace: NamespaceIdent::from_vec(vec!["trino_namespace".to_string()]).unwrap(),
-                warehouse_id: WarehouseId::from_str("490cbf7a-cbfe-11ef-84c5-178606d4cab3")
-                    .unwrap(),
+                warehouse_id: WarehouseId::from_str_or_internal(
+                    "490cbf7a-cbfe-11ef-84c5-178606d4cab3",
+                )
+                .unwrap(),
             },
         };
         let check = CheckRequest {
@@ -564,33 +573,27 @@ mod tests {
     }
 
     mod openfga_integration_tests {
-        use std::str::FromStr;
-
-        use iceberg_ext::catalog::rest::{CreateNamespaceRequest, CreateNamespaceResponse};
+        use lakekeeper::{
+            api::{
+                iceberg::v1::{namespace::NamespaceService, Prefix},
+                management::v1::{
+                    role::{CreateRoleRequest, Service as RoleService},
+                    ApiServer,
+                },
+                CreateNamespaceRequest,
+            },
+            catalog::{CatalogServer, NAMESPACE_ID_PROPERTY},
+            implementations::postgres::{PostgresCatalog, SecretsState},
+            service::{authn::UserId, CreateNamespaceResponse},
+            sqlx,
+            tests::{SetupTestCatalog, TestWarehouseResponse},
+        };
         use openfga_client::client::TupleKey;
         use strum::IntoEnumIterator;
         use uuid::Uuid;
 
         use super::super::{super::relations::*, *};
-        use crate::{
-            api::{
-                iceberg::v1::{namespace::NamespaceService, Prefix},
-                management::v1::{
-                    role::{CreateRoleRequest, Service as RoleService},
-                    warehouse::TabularDeleteProfile,
-                    ApiServer,
-                },
-            },
-            catalog::{CatalogServer, NAMESPACE_ID_PROPERTY},
-            implementations::postgres::{PostgresCatalog, SecretsState},
-            service::{
-                authn::UserId,
-                authz::implementations::openfga::{
-                    migration::tests::authorizer_for_empty_store, RoleAssignee,
-                },
-            },
-            tests::TestWarehouseResponse,
-        };
+        use crate::{migration::tests::authorizer_for_empty_store, models::RoleAssignee};
 
         async fn setup(
             operator_id: UserId,
@@ -600,20 +603,18 @@ mod tests {
             TestWarehouseResponse,
             CreateNamespaceResponse,
         ) {
-            let prof = crate::catalog::test::memory_io_profile();
             let authorizer = authorizer_for_empty_store().await.1;
-            let (ctx, warehouse) = crate::catalog::test::setup(
-                pool.clone(),
-                prof,
-                None,
-                authorizer.clone(),
-                TabularDeleteProfile::Hard {},
-                Some(operator_id.clone()),
-            )
-            .await;
+
+            let (ctx, warehouse) = SetupTestCatalog::builder()
+                .pool(pool.clone())
+                .authorizer(authorizer.clone())
+                .user_id(Some(operator_id.clone()))
+                .build()
+                .setup()
+                .await;
 
             let namespace = CatalogServer::create_namespace(
-                Some(Prefix(warehouse.warehouse_id.to_string())),
+                Some(Prefix::from(warehouse.warehouse_id.to_string())),
                 CreateNamespaceRequest {
                     namespace: NamespaceIdent::from_vec(vec!["ns1".to_string()]).unwrap(),
                     properties: None,
@@ -676,7 +677,7 @@ mod tests {
         async fn test_check(pool: sqlx::PgPool) {
             let operator_id = UserId::new_unchecked("oidc", &Uuid::now_v7().to_string());
             let (ctx, warehouse, namespace) = setup(operator_id.clone(), pool).await;
-            let namespace_id = NamespaceId::from_str(
+            let namespace_id = NamespaceId::from_str_or_internal(
                 namespace
                     .properties
                     .unwrap()

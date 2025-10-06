@@ -32,7 +32,7 @@ pub(crate) async fn drop_view<C: Catalog, A: Authorizer + Clone, S: SecretStore>
 ) -> Result<()> {
     // ------------------- VALIDATIONS -------------------
     let ViewParameters { prefix, view } = &parameters;
-    let warehouse_id = require_warehouse_id(prefix.clone())?;
+    let warehouse_id = require_warehouse_id(prefix.as_ref())?;
     validate_table_or_view_ident(view)?;
 
     // ------------------- AUTHZ -------------------
@@ -157,8 +157,6 @@ pub(crate) async fn drop_view<C: Catalog, A: Authorizer + Clone, S: SecretStore>
 
 #[cfg(test)]
 mod test {
-    use std::str::FromStr;
-
     use http::StatusCode;
     use iceberg::TableIdent;
     use iceberg_ext::catalog::rest::CreateViewRequest;
@@ -181,7 +179,7 @@ mod test {
         },
         request_metadata::RequestMetadata,
         service::task_queue::TaskEntity,
-        tests::random_request_metadata,
+        tests::{create_view_request, random_request_metadata},
         WarehouseId,
     };
 
@@ -190,8 +188,7 @@ mod test {
         let (api_context, namespace, whi) = setup(pool, None).await;
 
         let view_name = "my-view";
-        let rq: CreateViewRequest =
-            super::super::create::test::create_view_request(Some(view_name), None);
+        let rq: CreateViewRequest = create_view_request(Some(view_name), None);
 
         let prefix = &whi.to_string();
         let created_view = Box::pin(create_view(
@@ -270,8 +267,7 @@ mod test {
         let (api_context, namespace, whi) = setup(pool, None).await;
 
         let view_name = "my-view";
-        let rq: CreateViewRequest =
-            super::super::create::test::create_view_request(Some(view_name), None);
+        let rq: CreateViewRequest = create_view_request(Some(view_name), None);
 
         let prefix = &whi.to_string();
         let created_view = Box::pin(create_view(
@@ -298,7 +294,7 @@ mod test {
 
         ManagementApiServer::set_view_protection(
             loaded_view.metadata.uuid().into(),
-            WarehouseId::from_str(prefix.as_str()).unwrap(),
+            WarehouseId::from_str_or_internal(prefix.as_str()).unwrap(),
             true,
             api_context.clone(),
             random_request_metadata(),
@@ -325,7 +321,7 @@ mod test {
 
         ManagementApiServer::set_view_protection(
             loaded_view.metadata.uuid().into(),
-            WarehouseId::from_str(prefix.as_str()).unwrap(),
+            WarehouseId::from_str_or_internal(prefix.as_str()).unwrap(),
             false,
             api_context.clone(),
             random_request_metadata(),
@@ -366,8 +362,7 @@ mod test {
         let (api_context, namespace, whi) = setup(pool, None).await;
 
         let view_name = "my-view";
-        let rq: CreateViewRequest =
-            super::super::create::test::create_view_request(Some(view_name), None);
+        let rq: CreateViewRequest = create_view_request(Some(view_name), None);
 
         let prefix = &whi.to_string();
         let created_view = Box::pin(create_view(
@@ -394,7 +389,7 @@ mod test {
 
         ManagementApiServer::set_view_protection(
             loaded_view.metadata.uuid().into(),
-            WarehouseId::from_str(prefix.as_str()).unwrap(),
+            WarehouseId::from_str_or_internal(prefix.as_str()).unwrap(),
             true,
             api_context.clone(),
             random_request_metadata(),

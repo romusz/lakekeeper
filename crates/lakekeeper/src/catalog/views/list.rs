@@ -26,7 +26,7 @@ pub(crate) async fn list_views<C: Catalog, A: Authorizer + Clone, S: SecretStore
     let return_uuids = query.return_uuids;
     // ------------------- VALIDATIONS -------------------
     let NamespaceParameters { namespace, prefix } = parameters;
-    let warehouse_id = require_warehouse_id(prefix)?;
+    let warehouse_id = require_warehouse_id(prefix.as_ref())?;
 
     // ------------------- AUTHZ -------------------
     let authorizer = state.v1_state.authz;
@@ -96,6 +96,7 @@ mod test {
         implementations::postgres::{PostgresCatalog, SecretsState},
         request_metadata::RequestMetadata,
         service::{authz::tests::HidingAuthorizer, State, UserId},
+        tests::create_view_request,
     };
 
     async fn pagination_test_setup(
@@ -133,10 +134,7 @@ mod test {
         for i in 0..n_tables {
             let view = CatalogServer::create_view(
                 ns_params.clone(),
-                crate::catalog::views::create::test::create_view_request(
-                    Some(&format!("{i}")),
-                    None,
-                ),
+                create_view_request(Some(&format!("{i}")), None),
                 ctx.clone(),
                 DataAccess {
                     vended_credentials: true,
@@ -200,10 +198,7 @@ mod test {
         for i in 0..10 {
             let _ = CatalogServer::create_view(
                 ns_params.clone(),
-                crate::catalog::views::create::test::create_view_request(
-                    Some(&format!("view-{i}")),
-                    None,
-                ),
+                create_view_request(Some(&format!("view-{i}")), None),
                 ctx.clone(),
                 DataAccess {
                     vended_credentials: true,
@@ -411,10 +406,7 @@ mod test {
         for i in 0..10 {
             let _ = CatalogServer::create_view(
                 ns_params.clone(),
-                crate::catalog::views::create::test::create_view_request(
-                    Some(&format!("view-{i}")),
-                    None,
-                ),
+                create_view_request(Some(&format!("view-{i}")), None),
                 ctx.clone(),
                 DataAccess {
                     vended_credentials: true,

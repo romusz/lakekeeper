@@ -1,6 +1,4 @@
 use std::fmt::Debug;
-#[cfg(feature = "router")]
-use std::str::FromStr;
 
 #[cfg(feature = "router")]
 use axum::{
@@ -274,7 +272,7 @@ fn extract_role_id(
                 Some(Box::new(e)),
             )
         })?;
-        Ok(Some(RoleId::from_str(role_id)?))
+        Ok(Some(RoleId::from_str_or_bad_request(role_id)?))
     } else {
         Ok(None)
     }
@@ -287,7 +285,11 @@ impl std::fmt::Display for UserId {
 }
 
 impl UserId {
-    fn try_new(subject: Subject) -> Result<Self, ErrorModel> {
+    /// Create a new `UserId` from a `Subject`.
+    ///
+    /// # Errors
+    /// Returns an error if the subject is invalid, e.g. empty or too long.
+    pub fn try_new(subject: Subject) -> Result<Self, ErrorModel> {
         Self::validate_subject(subject.subject_in_idp())?;
         if subject.idp_id().is_none() {
             return Err(ErrorModel::bad_request(
@@ -299,7 +301,7 @@ impl UserId {
         Ok(Self(subject))
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "test-utils")]
     #[must_use]
     pub fn new_unchecked(idp_id: &str, sub: &str) -> Self {
         Self(Subject::new(Some(idp_id.to_string()), sub.to_string()))

@@ -47,7 +47,7 @@ pub(crate) async fn commit_view<C: Catalog, A: Authorizer + Clone, S: SecretStor
 ) -> Result<LoadViewResult> {
     let data_access = data_access.into();
     // ------------------- VALIDATIONS -------------------
-    let warehouse_id = require_warehouse_id(parameters.prefix.clone())?;
+    let warehouse_id = require_warehouse_id(parameters.prefix.as_ref())?;
 
     let CommitViewRequest {
         identifier,
@@ -400,10 +400,8 @@ mod test {
 
     use crate::{
         api::iceberg::v1::{views, DataAccess, Prefix, ViewParameters},
-        catalog::views::{
-            create::test::{create_view, create_view_request},
-            test::setup,
-        },
+        catalog::views::{create::test::create_view, test::setup},
+        tests::create_view_request,
         WarehouseId,
     };
 

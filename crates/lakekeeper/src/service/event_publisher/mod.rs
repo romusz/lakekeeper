@@ -30,7 +30,7 @@ use crate::{
     catalog::tables::{maybe_body_to_json, CommitContext},
     service::{
         endpoint_hooks::{EndpointHook, TableIdentToIdFn, ViewCommit},
-        tabular_idents::TabularId,
+        TabularId,
     },
     CONFIG,
 };
@@ -44,6 +44,7 @@ pub mod nats;
 ///
 /// # Errors
 /// If the publisher cannot be built from the configuration.
+#[allow(clippy::unused_async)]
 pub async fn get_default_cloud_event_backends_from_config(
 ) -> anyhow::Result<Vec<Arc<dyn CloudEventBackend + Sync + Send>>> {
     let mut cloud_event_sinks = vec![];

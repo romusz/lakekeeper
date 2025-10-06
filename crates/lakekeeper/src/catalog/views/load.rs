@@ -28,7 +28,7 @@ pub(crate) async fn load_view<C: Catalog, A: Authorizer + Clone, S: SecretStore>
     let data_access = data_access.into();
     // ------------------- VALIDATIONS -------------------
     let ViewParameters { prefix, view } = parameters;
-    let warehouse_id = require_warehouse_id(prefix)?;
+    let warehouse_id = require_warehouse_id(prefix.as_ref())?;
     // ToDo: Remove workaround when hierarchical namespaces are supported.
     // It is important for now to throw a 404 if a table cannot be found,
     // because spark might check if `table`.`branch` exists, which should return 404.
@@ -138,6 +138,7 @@ pub(crate) mod test {
         },
         implementations::postgres::{secrets::SecretsState, PostgresCatalog},
         service::{authz::AllowAllAuthorizer, State},
+        tests::create_view_request,
     };
 
     pub(crate) async fn load_view(
@@ -163,8 +164,7 @@ pub(crate) mod test {
         let (api_context, namespace, whi) = setup(pool, None).await;
 
         let view_name = "my-view";
-        let rq: CreateViewRequest =
-            super::super::create::test::create_view_request(Some(view_name), None);
+        let rq: CreateViewRequest = create_view_request(Some(view_name), None);
 
         let prefix = &whi.to_string();
         let created_view = Box::pin(create_view(
