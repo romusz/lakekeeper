@@ -18,9 +18,9 @@ use super::{
     },
     warehouse::{
         create_project, create_warehouse, delete_project, delete_warehouse,
-        get_config_for_warehouse, get_project, get_warehouse, get_warehouse_by_name, list_projects,
-        list_warehouses, rename_project, rename_warehouse, set_warehouse_deletion_profile,
-        set_warehouse_status, update_storage_profile,
+        get_config_for_warehouse, get_project, get_warehouse_by_id, get_warehouse_by_name,
+        list_projects, list_warehouses, rename_project, rename_warehouse,
+        set_warehouse_deletion_profile, set_warehouse_status, update_storage_profile,
     },
     CatalogState, PostgresTransaction,
 };
@@ -70,7 +70,9 @@ use crate::{
             Task, TaskAttemptId, TaskCheckState, TaskEntity, TaskFilter, TaskId, TaskInput,
             TaskQueueName,
         },
-        CatalogStore, CreateNamespaceRequest, CreateNamespaceResponse, CreateOrUpdateUserResponse,
+        CatalogCreateWarehouseError, CatalogDeleteWarehouseError, CatalogGetWarehouseByIdError,
+        CatalogListWarehousesError, CatalogRenameWarehouseError, CatalogStore,
+        CreateNamespaceRequest, CreateNamespaceResponse, CreateOrUpdateUserResponse,
         CreateTableResponse, GetNamespaceResponse, GetProjectResponse, GetTableMetadataResponse,
         GetWarehouseResponse, ListNamespacesQuery, LoadTableResponse, NamespaceDropInfo,
         NamespaceId, NamespaceIdent, NamespaceInfo, ProjectId, Result, RoleId, ServerInfo,
@@ -390,14 +392,14 @@ impl CatalogStore for super::PostgresBackend {
         delete_user(user_id, &mut **transaction).await
     }
 
-    async fn create_warehouse<'a>(
+    async fn create_warehouse_impl<'a>(
         warehouse_name: String,
         project_id: &ProjectId,
         storage_profile: StorageProfile,
         tabular_delete_profile: TabularDeleteProfile,
         storage_secret_id: Option<SecretIdent>,
         transaction: <Self::Transaction as Transaction<CatalogState>>::Transaction<'a>,
-    ) -> Result<WarehouseId> {
+    ) -> std::result::Result<WarehouseId, CatalogCreateWarehouseError> {
         create_warehouse(
             warehouse_name,
             project_id,
@@ -458,19 +460,19 @@ impl CatalogStore for super::PostgresBackend {
         .await
     }
 
-    async fn list_warehouses(
+    async fn list_warehouses_impl(
         project_id: &ProjectId,
-        include_inactive: Option<Vec<WarehouseStatus>>,
-        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
-    ) -> Result<Vec<GetWarehouseResponse>> {
-        list_warehouses(project_id, include_inactive, &mut **transaction).await
+        status_filter: Option<Vec<WarehouseStatus>>,
+        catalog_state: Self::State,
+    ) -> std::result::Result<Vec<GetWarehouseResponse>, CatalogListWarehousesError> {
+        list_warehouses(project_id, status_filter, &catalog_state.read_pool()).await
     }
 
-    async fn get_warehouse<'a>(
+    async fn get_warehouse_by_id_impl<'a>(
         warehouse_id: WarehouseId,
-        transaction: <Self::Transaction as Transaction<CatalogState>>::Transaction<'a>,
-    ) -> Result<Option<GetWarehouseResponse>> {
-        get_warehouse(warehouse_id, transaction).await
+        state: Self::State,
+    ) -> std::result::Result<Option<GetWarehouseResponse>, CatalogGetWarehouseByIdError> {
+        get_warehouse_by_id(warehouse_id, &state.read_pool()).await
     }
 
     async fn get_warehouse_stats(
@@ -481,19 +483,19 @@ impl CatalogStore for super::PostgresBackend {
         get_warehouse_stats(state.read_pool(), warehouse_id, pagination_query).await
     }
 
-    async fn delete_warehouse<'a>(
+    async fn delete_warehouse_impl<'a>(
         warehouse_id: WarehouseId,
         query: DeleteWarehouseQuery,
         transaction: <Self::Transaction as Transaction<CatalogState>>::Transaction<'a>,
-    ) -> Result<()> {
+    ) -> Result<(), CatalogDeleteWarehouseError> {
         delete_warehouse(warehouse_id, query, transaction).await
     }
 
-    async fn rename_warehouse<'a>(
+    async fn rename_warehouse_impl<'a>(
         warehouse_id: WarehouseId,
         new_name: &str,
         transaction: <Self::Transaction as Transaction<CatalogState>>::Transaction<'a>,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), CatalogRenameWarehouseError> {
         rename_warehouse(warehouse_id, new_name, transaction).await
     }
 
