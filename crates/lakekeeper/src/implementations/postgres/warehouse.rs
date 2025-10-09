@@ -12,7 +12,10 @@ use crate::{
         },
         ErrorModel, Result,
     },
-    implementations::postgres::pagination::{PaginateToken, V1PaginateToken},
+    implementations::postgres::{
+        dbutils::DBErrorHandler,
+        pagination::{PaginateToken, V1PaginateToken},
+    },
     service::{
         storage::StorageProfile, CatalogCreateWarehouseError, CatalogDeleteWarehouseError,
         CatalogGetWarehouseByIdError, CatalogGetWarehouseByNameError, CatalogListWarehousesError,
@@ -281,7 +284,7 @@ pub(crate) async fn list_warehouses<
     )
     .fetch_all(catalog_state)
     .await
-    .map_err(super::dbutils::DBErrorHandler::into_catalog_backend_error)?;
+    .map_err(DBErrorHandler::into_catalog_backend_error)?;
 
     warehouses
         .into_iter()
@@ -331,7 +334,7 @@ pub(super) async fn get_warehouse_by_name(
     )
     .fetch_optional(&catalog_state.read_pool())
     .await
-    .map_err(|e| e.into_catalog_backend_error())?;
+    .map_err(DBErrorHandler::into_catalog_backend_error)?;
 
     if let Some(warehouse) = warehouse {
         let tabular_delete_profile = db_to_api_tabular_delete_profile(
@@ -380,7 +383,7 @@ pub(crate) async fn get_warehouse_by_id<
     )
     .fetch_optional(catalog_state)
     .await
-    .map_err(super::dbutils::DBErrorHandler::into_catalog_backend_error)?;
+    .map_err(DBErrorHandler::into_catalog_backend_error)?;
 
     if let Some(warehouse) = warehouse {
         let tabular_delete_profile = db_to_api_tabular_delete_profile(
@@ -500,7 +503,7 @@ pub(crate) async fn rename_warehouse(
     )
     .execute(&mut **transaction)
     .await
-    .map_err(super::dbutils::DBErrorHandler::into_catalog_backend_error)?
+    .map_err(DBErrorHandler::into_catalog_backend_error)?
     .rows_affected();
 
     if row_count == 0 {

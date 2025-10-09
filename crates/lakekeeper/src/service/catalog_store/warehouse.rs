@@ -537,9 +537,7 @@ where
         project_id: &ProjectId,
         catalog_state: Self::State,
     ) -> Result<Option<GetWarehouseResponse>, CatalogGetWarehouseByNameError> {
-        Self::get_warehouse_by_name_impl(warehouse_name, project_id, catalog_state)
-            .await
-            .map_err(Into::into)
+        Self::get_warehouse_by_name_impl(warehouse_name, project_id, catalog_state).await
     }
 
     /// Wrapper around `get_warehouse_by_name` that returns
