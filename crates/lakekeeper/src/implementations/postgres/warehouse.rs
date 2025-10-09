@@ -2,7 +2,7 @@ use std::{collections::HashSet, ops::Deref};
 
 use sqlx::{types::Json, PgPool};
 
-use super::{dbutils::DBErrorHandler as _, CatalogState};
+use super::CatalogState;
 use crate::{
     api::{
         iceberg::v1::PaginationQuery,
