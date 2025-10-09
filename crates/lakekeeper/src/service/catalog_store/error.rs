@@ -58,6 +58,7 @@ macro_rules! define_simple_error {
         }
 
         impl $error_name {
+            #[must_use]
             pub fn new() -> Self {
                 Self { stack: Vec::new() }
             }

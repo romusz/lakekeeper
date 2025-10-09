@@ -25,7 +25,7 @@ impl DBErrorHandler for sqlx::Error {
                         Some(Box::new(self)),
                     );
                 }
-                match db.code().as_deref().map(|s| &s[..2]) {
+                match db.code().as_deref() {
                     // https://www.postgresql.org/docs/current/errcodes-appendix.html
                     Some(
                         "2D000" | "25000" | "25001" | "25P01" | "25P02" | "25P03" | "40000"
@@ -47,7 +47,7 @@ impl DBErrorHandler for sqlx::Error {
             Self::Database(ref db) => {
                 // In our new error model, entity already exists should always have
                 // an explicit error variant, so we treat it as unexpected here.
-                match db.code().as_deref().map(|s| &s[..2]) {
+                match db.code().as_deref() {
                     // https://www.postgresql.org/docs/current/errcodes-appendix.html
                     Some(
                         "2D000" | "25000" | "25001" | "25P01" | "25P02" | "25P03" | "40000"
