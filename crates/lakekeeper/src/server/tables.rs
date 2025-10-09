@@ -355,7 +355,7 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
         let TableParameters { prefix, table } = parameters;
         let warehouse_id = require_warehouse_id(prefix.as_ref())?;
 
-        let mut t = C::Transaction::begin_read(state.v1_state.catalog).await?;
+        let mut t = C::Transaction::begin_read(state.v1_state.catalog.clone()).await?;
         let (tabular_details, storage_permissions) = resolve_and_authorize_table_access::<C, A>(
             &request_metadata,
             &table,
@@ -369,21 +369,20 @@ impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore>
             t.transaction(),
         )
         .await?;
+        t.commit().await?;
         let storage_permission = storage_permissions.ok_or(ErrorModel::unauthorized(
             "No storage permissions for table",
             "NoStoragePermissions",
             None,
         ))?;
 
-        let (storage_secret_ident, storage_profile) =
-            C::load_storage_profile(warehouse_id, tabular_details.table_id, t.transaction())
-                .await?;
-        // DB work is done; release the read transaction before external IO/crypto work.
-        t.commit().await?;
+        let warehouse =
+            C::require_warehouse_by_id(warehouse_id, state.v1_state.catalog.clone()).await?;
 
         let storage_secret =
-            maybe_get_secret(storage_secret_ident, &state.v1_state.secrets).await?;
-        let storage_config = storage_profile
+            maybe_get_secret(warehouse.storage_secret_id, &state.v1_state.secrets).await?;
+        let storage_config = warehouse
+            .storage_profile
             .generate_table_config(
                 data_access.into(),
                 storage_secret.as_ref(),

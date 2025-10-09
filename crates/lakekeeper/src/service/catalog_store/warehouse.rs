@@ -99,6 +99,35 @@ impl From<WarehouseIdNotFound> for ErrorModel {
     }
 }
 
+#[derive(thiserror::Error, Debug, PartialEq)]
+#[error("A warehouse '{warehouse_name}' does not exist")]
+pub struct WarehouseNameNotFound {
+    pub warehouse_name: String,
+    pub stack: Vec<String>,
+}
+impl WarehouseNameNotFound {
+    #[must_use]
+    pub fn new(warehouse_name: impl Into<String>) -> Self {
+        Self {
+            warehouse_name: warehouse_name.into(),
+            stack: Vec::new(),
+        }
+    }
+}
+impl_error_stack_methods!(WarehouseNameNotFound);
+
+impl From<WarehouseNameNotFound> for ErrorModel {
+    fn from(err: WarehouseNameNotFound) -> Self {
+        ErrorModel {
+            r#type: "WarehouseNotFound".to_string(),
+            code: StatusCode::NOT_FOUND.as_u16(),
+            message: err.to_string(),
+            stack: err.stack,
+            source: None,
+        }
+    }
+}
+
 // --------------------------- CREATE ERROR ---------------------------
 #[derive(thiserror::Error, Debug)]
 pub enum CatalogCreateWarehouseError {
@@ -380,6 +409,52 @@ impl From<CatalogGetWarehouseByIdError> for IcebergErrorResponse {
     }
 }
 
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub enum CatalogGetWarehouseByNameError {
+    #[error(transparent)]
+    CatalogBackendError(CatalogBackendError),
+    #[error(transparent)]
+    DatabaseIntegrityError(DatabaseIntegrityError),
+    #[error(transparent)]
+    WarehouseNameNotFound(WarehouseNameNotFound),
+}
+impl CatalogGetWarehouseByNameError {
+    #[must_use]
+    pub fn append_detail(mut self, detail: String) -> Self {
+        match &mut self {
+            CatalogGetWarehouseByNameError::CatalogBackendError(e) => {
+                e.append_detail_mut(detail);
+            }
+            CatalogGetWarehouseByNameError::DatabaseIntegrityError(e) => {
+                e.append_detail_mut(detail);
+            }
+            CatalogGetWarehouseByNameError::WarehouseNameNotFound(e) => {
+                e.append_detail_mut(detail);
+            }
+        }
+        self
+    }
+}
+const GET_BY_NAME_ERROR_STACK: &str = "Error getting warehouse by name in catalog";
+impl_from_with_detail!(CatalogBackendError => CatalogGetWarehouseByNameError::CatalogBackendError, GET_BY_NAME_ERROR_STACK);
+impl_from_with_detail!(DatabaseIntegrityError => CatalogGetWarehouseByNameError::DatabaseIntegrityError, GET_BY_NAME_ERROR_STACK);
+impl_from_with_detail!(WarehouseNameNotFound => CatalogGetWarehouseByNameError::WarehouseNameNotFound, GET_BY_NAME_ERROR_STACK);
+
+impl From<CatalogGetWarehouseByNameError> for ErrorModel {
+    fn from(err: CatalogGetWarehouseByNameError) -> Self {
+        match err {
+            CatalogGetWarehouseByNameError::DatabaseIntegrityError(e) => e.into(),
+            CatalogGetWarehouseByNameError::CatalogBackendError(e) => e.into(),
+            CatalogGetWarehouseByNameError::WarehouseNameNotFound(e) => e.into(),
+        }
+    }
+}
+impl From<CatalogGetWarehouseByNameError> for IcebergErrorResponse {
+    fn from(err: CatalogGetWarehouseByNameError) -> Self {
+        ErrorModel::from(err).into()
+    }
+}
+
 #[async_trait::async_trait]
 pub trait CatalogWarehouseOps
 where
@@ -455,6 +530,28 @@ where
         Self::get_warehouse_by_id(warehouse_id, state)
             .await?
             .ok_or(WarehouseIdNotFound::new(warehouse_id).into())
+    }
+
+    async fn get_warehouse_by_name(
+        warehouse_name: &str,
+        project_id: &ProjectId,
+        catalog_state: Self::State,
+    ) -> Result<Option<GetWarehouseResponse>, CatalogGetWarehouseByNameError> {
+        Self::get_warehouse_by_name_impl(warehouse_name, project_id, catalog_state)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Wrapper around `get_warehouse_by_name` that returns
+    /// not found error if the warehouse does not exist.
+    async fn require_warehouse_by_name(
+        warehouse_name: &str,
+        project_id: &ProjectId,
+        catalog_state: Self::State,
+    ) -> Result<GetWarehouseResponse, CatalogGetWarehouseByNameError> {
+        Self::get_warehouse_by_name(warehouse_name, project_id, catalog_state)
+            .await?
+            .ok_or(WarehouseNameNotFound::new(warehouse_name.to_string()).into())
     }
 }
 

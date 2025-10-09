@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::Duration;
 use iceberg::spec::ViewMetadata;
-use iceberg_ext::catalog::rest::{CatalogConfig, ErrorModel};
+use iceberg_ext::catalog::rest::ErrorModel;
 use lakekeeper_io::Location;
 
 use super::{
@@ -17,10 +17,10 @@ use super::{
         load_tables, rename_table, resolve_table_ident, table_idents_to_ids,
     },
     warehouse::{
-        create_project, create_warehouse, delete_project, delete_warehouse,
-        get_config_for_warehouse, get_project, get_warehouse_by_id, get_warehouse_by_name,
-        list_projects, list_warehouses, rename_project, rename_warehouse,
-        set_warehouse_deletion_profile, set_warehouse_status, update_storage_profile,
+        create_project, create_warehouse, delete_project, delete_warehouse, get_project,
+        get_warehouse_by_id, get_warehouse_by_name, list_projects, list_warehouses, rename_project,
+        rename_warehouse, set_warehouse_deletion_profile, set_warehouse_status,
+        update_storage_profile,
     },
     CatalogState, PostgresTransaction,
 };
@@ -50,7 +50,7 @@ use crate::{
         tabular::{
             clear_tabular_deleted_at, get_tabular_protected, list_tabulars,
             mark_tabular_as_deleted, search_tabular, set_tabular_protected,
-            table::{commit_table_transaction, create_table, load_storage_profile},
+            table::{commit_table_transaction, create_table},
             view::{create_view, drop_view, list_views, load_view, rename_view, view_ident_to_id},
         },
         tasks::{
@@ -62,7 +62,6 @@ use crate::{
         user::{create_or_update_user, delete_user, list_users, search_user},
         warehouse::{get_warehouse_stats, set_warehouse_protection},
     },
-    request_metadata::RequestMetadata,
     service::{
         authn::UserId,
         storage::StorageProfile,
@@ -71,8 +70,8 @@ use crate::{
             TaskQueueName,
         },
         CatalogCreateWarehouseError, CatalogDeleteWarehouseError, CatalogGetWarehouseByIdError,
-        CatalogListWarehousesError, CatalogRenameWarehouseError, CatalogStore,
-        CreateNamespaceRequest, CreateNamespaceResponse, CreateOrUpdateUserResponse,
+        CatalogGetWarehouseByNameError, CatalogListWarehousesError, CatalogRenameWarehouseError,
+        CatalogStore, CreateNamespaceRequest, CreateNamespaceResponse, CreateOrUpdateUserResponse,
         CreateTableResponse, GetNamespaceResponse, GetProjectResponse, GetTableMetadataResponse,
         GetWarehouseResponse, ListNamespacesQuery, LoadTableResponse, NamespaceDropInfo,
         NamespaceId, NamespaceIdent, NamespaceInfo, ProjectId, Result, RoleId, ServerInfo,
@@ -102,20 +101,12 @@ impl CatalogStore for super::PostgresBackend {
         bootstrap(terms_accepted, &mut **transaction).await
     }
 
-    async fn get_warehouse_by_name(
+    async fn get_warehouse_by_name_impl(
         warehouse_name: &str,
         project_id: &ProjectId,
         catalog_state: CatalogState,
-    ) -> Result<Option<WarehouseId>> {
+    ) -> Result<Option<GetWarehouseResponse>, CatalogGetWarehouseByNameError> {
         get_warehouse_by_name(warehouse_name, project_id, catalog_state).await
-    }
-
-    async fn get_config_for_warehouse(
-        warehouse_id: WarehouseId,
-        catalog_state: CatalogState,
-        request_metadata: &RequestMetadata,
-    ) -> Result<Option<CatalogConfig>> {
-        get_config_for_warehouse(warehouse_id, catalog_state, request_metadata).await
     }
 
     async fn list_namespaces<'a>(
@@ -671,15 +662,6 @@ impl CatalogStore for super::PostgresBackend {
         )
         .await
     }
-
-    async fn load_storage_profile(
-        warehouse_id: WarehouseId,
-        tabular_id: TableId,
-        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'_>,
-    ) -> Result<(Option<SecretIdent>, StorageProfile)> {
-        load_storage_profile(warehouse_id, tabular_id, transaction).await
-    }
-
     async fn set_tabular_protected(
         warehouse_id: WarehouseId,
         tabular_id: TabularId,

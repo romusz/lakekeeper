@@ -10,42 +10,19 @@ use crate::{
             warehouse::{TabularDeleteProfile, WarehouseStatistics, WarehouseStatisticsResponse},
             DeleteWarehouseQuery, ProtectionResponse,
         },
-        CatalogConfig, ErrorModel, Result,
+        ErrorModel, Result,
     },
     implementations::postgres::pagination::{PaginateToken, V1PaginateToken},
-    request_metadata::RequestMetadata,
     service::{
         storage::StorageProfile, CatalogCreateWarehouseError, CatalogDeleteWarehouseError,
-        CatalogGetWarehouseByIdError, CatalogListWarehousesError, CatalogRenameWarehouseError,
-        DatabaseIntegrityError, GetProjectResponse, GetWarehouseResponse, ProjectIdNotFoundError,
-        StorageProfileSerializationError, WarehouseAlreadyExists, WarehouseHasUnfinishedTasks,
-        WarehouseIdNotFound, WarehouseNotEmpty, WarehouseProtected, WarehouseStatus,
+        CatalogGetWarehouseByIdError, CatalogGetWarehouseByNameError, CatalogListWarehousesError,
+        CatalogRenameWarehouseError, DatabaseIntegrityError, GetProjectResponse,
+        GetWarehouseResponse, ProjectIdNotFoundError, StorageProfileSerializationError,
+        WarehouseAlreadyExists, WarehouseHasUnfinishedTasks, WarehouseIdNotFound,
+        WarehouseNotEmpty, WarehouseProtected, WarehouseStatus,
     },
     ProjectId, SecretIdent, WarehouseId, CONFIG,
 };
-
-pub(super) async fn get_warehouse_by_name(
-    warehouse_name: &str,
-    project_id: &ProjectId,
-    catalog_state: CatalogState,
-) -> Result<Option<WarehouseId>> {
-    let warehouse_id = sqlx::query_scalar!(
-        r#"
-            SELECT
-                warehouse_id
-            FROM warehouse
-            WHERE warehouse_name = $1 AND project_id = $2
-            AND status = 'active'
-            "#,
-        warehouse_name.to_string(),
-        project_id
-    )
-    .fetch_optional(&catalog_state.read_pool())
-    .await
-    .map_err(map_select_warehouse_err)?;
-
-    Ok(warehouse_id.map(Into::into))
-}
 
 pub(super) async fn set_warehouse_deletion_profile<
     'c,
@@ -82,42 +59,6 @@ pub(super) async fn set_warehouse_deletion_profile<
     }
 
     Ok(())
-}
-
-pub(super) async fn get_config_for_warehouse(
-    warehouse_id: WarehouseId,
-    catalog_state: CatalogState,
-    request_metadata: &RequestMetadata,
-) -> Result<Option<CatalogConfig>> {
-    let row = sqlx::query!(
-        r#"
-            SELECT
-                storage_profile as "storage_profile: Json<StorageProfile>",
-                tabular_delete_mode as "tabular_delete_mode: DbTabularDeleteProfile",
-                tabular_expiration_seconds
-            FROM warehouse
-            WHERE warehouse_id = $1
-            AND status = 'active'
-            "#,
-        *warehouse_id
-    )
-    .fetch_optional(&catalog_state.read_pool())
-    .await
-    .map_err(map_select_warehouse_err)?;
-
-    if let Some(row) = row {
-        let delete_profile = db_to_api_tabular_delete_profile_deprecated(
-            row.tabular_delete_mode,
-            row.tabular_expiration_seconds,
-        )?;
-        Ok(Some(row.storage_profile.generate_catalog_config(
-            warehouse_id,
-            request_metadata,
-            delete_profile,
-        )))
-    } else {
-        Ok(None)
-    }
 }
 
 pub(crate) async fn create_warehouse(
@@ -362,6 +303,55 @@ pub(crate) async fn list_warehouses<
             })
         })
         .collect()
+}
+
+pub(super) async fn get_warehouse_by_name(
+    warehouse_name: &str,
+    project_id: &ProjectId,
+    catalog_state: CatalogState,
+) -> Result<Option<GetWarehouseResponse>, CatalogGetWarehouseByNameError> {
+    let warehouse = sqlx::query!(
+        r#"
+        SELECT
+            warehouse_id,
+            warehouse_name,
+            project_id,
+            storage_profile as "storage_profile: Json<StorageProfile>",
+            storage_secret_id,
+            status AS "status: WarehouseStatus",
+            tabular_delete_mode as "tabular_delete_mode: DbTabularDeleteProfile",
+            tabular_expiration_seconds,
+            protected
+        FROM warehouse
+        WHERE warehouse_name = $1 AND project_id = $2
+        AND status = 'active'
+        "#,
+        warehouse_name.to_string(),
+        project_id
+    )
+    .fetch_optional(&catalog_state.read_pool())
+    .await
+    .map_err(|e| e.into_catalog_backend_error())?;
+
+    if let Some(warehouse) = warehouse {
+        let tabular_delete_profile = db_to_api_tabular_delete_profile(
+            warehouse.tabular_delete_mode,
+            warehouse.tabular_expiration_seconds,
+        )?;
+
+        Ok(Some(GetWarehouseResponse {
+            id: warehouse.warehouse_id.into(),
+            name: warehouse.warehouse_name,
+            project_id: ProjectId::from_db_unchecked(warehouse.project_id),
+            storage_profile: warehouse.storage_profile.deref().clone(),
+            storage_secret_id: warehouse.storage_secret_id.map(std::convert::Into::into),
+            status: warehouse.status,
+            tabular_delete_profile,
+            protected: warehouse.protected,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) async fn get_warehouse_by_id<
@@ -613,14 +603,6 @@ pub(crate) async fn update_storage_profile(
     Ok(())
 }
 
-fn map_select_warehouse_err(e: sqlx::Error) -> ErrorModel {
-    ErrorModel::internal(
-        "Error fetching warehouse",
-        "WarehouseFetchError",
-        Some(Box::new(e)),
-    )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "tabular_delete_mode", rename_all = "kebab-case")]
 enum DbTabularDeleteProfile {
@@ -634,26 +616,6 @@ impl From<TabularDeleteProfile> for DbTabularDeleteProfile {
             TabularDeleteProfile::Soft { .. } => DbTabularDeleteProfile::Soft,
             TabularDeleteProfile::Hard {} => DbTabularDeleteProfile::Hard,
         }
-    }
-}
-
-/// Convert a database tabular delete profile to the API tabular delete profile
-fn db_to_api_tabular_delete_profile_deprecated(
-    mode: DbTabularDeleteProfile,
-    expiration_seconds: Option<i64>,
-) -> Result<TabularDeleteProfile> {
-    match mode {
-        DbTabularDeleteProfile::Soft => {
-            let seconds = expiration_seconds.ok_or(ErrorModel::internal(
-                "Tabular expiration seconds not found",
-                "TabularExpirationSecondsNotFound",
-                None,
-            ))?;
-            Ok(TabularDeleteProfile::Soft {
-                expiration_seconds: chrono::Duration::seconds(seconds),
-            })
-        }
-        DbTabularDeleteProfile::Hard => Ok(TabularDeleteProfile::Hard {}),
     }
 }
 
@@ -823,7 +785,7 @@ pub(crate) mod test {
         let state = CatalogState::from_pools(pool.clone(), pool.clone());
         let warehouse_id = initialize_warehouse(state.clone(), None, None, None, true).await;
 
-        let fetched_warehouse_id = PostgresBackend::get_warehouse_by_name(
+        let fetched_warehouse = PostgresBackend::get_warehouse_by_name(
             "test_warehouse",
             &ProjectId::from(uuid::Uuid::nil()),
             state.clone(),
@@ -831,7 +793,7 @@ pub(crate) mod test {
         .await
         .unwrap();
 
-        assert_eq!(Some(warehouse_id), fetched_warehouse_id);
+        assert_eq!(Some(warehouse_id), fetched_warehouse.map(|w| w.id));
     }
 
     #[sqlx::test]
